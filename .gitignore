@@ -1,0 +1,53 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*-sa.json
+*service-account*.json
+credentials*.json
+gcloud-*.json
+
+# ---- Private planning docs (local only, per tech lead) ----
+DECISIONS.md
+docs/design/
+CaseLens — Project Overview & Agent Build Guide.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Node / web ----
+node_modules/
+apps/web/dist/
+*.tsbuildinfo
+
+# ---- Terraform ----
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# ---- Generated synthetic data and eval output (regenerate from data_gen/) ----
+data_gen/output/
+evals/results/
+
+# ---- OS / editors ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
