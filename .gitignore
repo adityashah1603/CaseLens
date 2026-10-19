@@ -51,3 +51,7 @@ Thumbs.db
 .vscode/
 data_gen/.voices/
 data_gen/.cache/
+
+# Downloaded model weights (fastembed, whisper, YOLO, speechbrain)
+.cache/
+*.pt

@@ -2,7 +2,7 @@
 #   Windows: python -m venv .venv && .venv/Scripts/python -m pip install -r requirements-dev.txt
 #   Unix:    python -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
 -e ./apps/api
--e ./workers
+-e ./workers[pdf,audio,video,extract]
 -e ./packages/agent
 -e ./packages/retrieval
 -e ./packages/semantic_layer

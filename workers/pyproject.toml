@@ -7,7 +7,21 @@ name = "caselens-workers"
 version = "0.0.1"
 description = "CaseLens ingestion workers (per-modality pipelines)."
 requires-python = ">=3.11"
-dependencies = []
+# Free / open-source only. Heavy model stacks live in extras so a CPU-only box can install a subset.
+dependencies = [
+  "pydantic>=2.11",
+  "pydantic-settings>=2.10",
+  "psycopg[binary]>=3.2",
+  "minio>=7.2",
+  "numpy>=2.0",
+  "fastembed>=0.7",
+]
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.26", "rapidocr-onnxruntime>=1.4", "pillow>=11"]
+audio = ["faster-whisper>=1.1", "speechbrain>=1.0", "soundfile>=0.13", "scikit-learn>=1.6"]
+video = ["ultralytics>=8.3", "scenedetect>=0.6", "opencv-python-headless>=4.10"]
+extract = ["rapidfuzz>=3.10", "httpx>=0.28"]
 
 [tool.setuptools.packages.find]
 include = ["caselens_workers*"]
