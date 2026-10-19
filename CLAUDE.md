@@ -1,9 +1,13 @@
 # CLAUDE.md — CaseLens
 
-Read this file first in every session. The full source of truth is the local (gitignored)
-project guide, `CaseLens — Project Overview & Agent Build Guide.md`. Local-only design notes live in
-`docs/design/SYSTEM_DESIGN.md` and `DECISIONS.md` (also gitignored). If any of these
-conflict, the project guide wins; if something is ambiguous, ask the tech lead instead of guessing.
+Read this file first in every session. Reference docs live in `reference/`, which is local-only
+(gitignored) and **read-only**: do not edit them unless the tech lead says so.
+- `reference/CaseLens — Project Overview & Agent Build Guide.md`: the source of truth
+- `reference/ROADMAP.md`: the 6 weeks and their gates
+- `reference/SYSTEM_DESIGN.md`: requirements, entities, APIs, design
+- `reference/DECISIONS.md`: the decision log (clear the read-only flag only to append a decision)
+
+If these conflict, the project guide wins. If something is ambiguous, ask the tech lead instead of guessing.
 
 ## Project summary
 
@@ -42,7 +46,7 @@ ground-truth story in `data_gen/`. Every generated file carries a SYNTHETIC head
 | Frontend | React + TypeScript (Vite), Tailwind + shadcn/ui, TanStack Query |
 | Infra | Terraform on GCP, GitHub Actions CI/CD, `docker compose` for local dev |
 
-Prefer free / open-source tools and free tiers (see `DECISIONS.md`).
+Prefer free / open-source tools and free tiers (see `reference/DECISIONS.md`).
 
 ## Repo map and ownership
 
@@ -62,7 +66,7 @@ Prefer free / open-source tools and free tiers (see `DECISIONS.md`).
 ### Contracts (frozen; change only with tech-lead approval)
 
 - API: `docs/contracts/openapi.yaml`
-- DB schema + RLS: `apps/api/alembic/versions/0001_initial_schema.py`
+- DB schema + RLS: `apps/api/alembic/versions/` (0001 initial, 0002 admin + run updates)
 - Agent tool schemas: `packages/agent/caselens_agent/schemas/tools/*.json`
 - Answer contract: `packages/agent/caselens_agent/schemas/answer.schema.json`
 - Semantic layer: `packages/semantic_layer/caselens_semantic_layer/semantic_layer.yaml`
@@ -83,7 +87,7 @@ stop and propose the change to the tech lead.
 6. The tech lead reviews every PR, especially auth, RLS, audit, and SQL compilation.
    **Never "simplify" a security control** (RLS policies, audit hash chain, read-only SQL role,
    citation validator, auth checks). If one gets in your way, ask.
-7. Log every architectural choice in `DECISIONS.md`: the context, the alternatives, and why.
+7. Log every architectural choice in `reference/DECISIONS.md`: the context, the alternatives, and why.
 
 **Dependency order:** contracts → infra + data-gen (parallel) → ingestion + backend (parallel) →
 retrieval → agent-core → frontend. Evals gate everything from week 2 onward.

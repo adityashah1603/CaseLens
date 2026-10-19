@@ -10,10 +10,8 @@
 credentials*.json
 gcloud-*.json
 
-# ---- Private planning docs (local only, per tech lead) ----
-DECISIONS.md
-docs/design/
-CaseLens — Project Overview & Agent Build Guide.md
+# ---- Reference docs (local only, read-only, per tech lead) ----
+reference/
 
 # ---- Python ----
 __pycache__/
