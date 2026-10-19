@@ -7,10 +7,21 @@ name = "caselens-data-gen"
 version = "0.0.1"
 description = "CaseLens synthetic case data generators (SYNTHETIC DATA ONLY)."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "pydantic>=2.14",
+  "numpy>=2.4",
+  "fpdf2>=2.8",
+  "pymupdf>=2.0",
+  "pillow>=13.0",
+]
+
+[project.optional-dependencies]
+# Heavy generators, not needed for tests or CI.
+audio = ["piper-tts>=1.8"]
+video = ["opencv-python-headless>=5.0"]
 
 [tool.setuptools.packages.find]
 include = ["caselens_data_gen*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.yaml", "py.typed"]
+"*" = ["*.json", "py.typed"]

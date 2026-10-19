@@ -49,3 +49,5 @@ evals/results/
 Thumbs.db
 .idea/
 .vscode/
+data_gen/.voices/
+data_gen/.cache/
