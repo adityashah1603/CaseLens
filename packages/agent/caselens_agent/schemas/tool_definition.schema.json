@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://caselens.dev/schemas/tool_definition.schema.json",
+  "title": "CaseLens agent tool definition",
+  "description": "Shape of each file in schemas/tools/. name/description/input_schema map directly to an Anthropic tool-use definition; output_schema describes what the tool returns. input_schema must be self-contained (no $ref); tests enforce that.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "description",
+    "input_schema",
+    "output_schema"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 40
+    },
+    "input_schema": {
+      "type": "object",
+      "required": [
+        "type",
+        "additionalProperties",
+        "required",
+        "properties"
+      ],
+      "properties": {
+        "type": {
+          "const": "object"
+        },
+        "additionalProperties": {
+          "const": false
+        },
+        "required": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "properties": {
+          "type": "object",
+          "minProperties": 1
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "required": [
+        "type",
+        "properties"
+      ],
+      "properties": {
+        "type": {
+          "const": "object"
+        },
+        "additionalProperties": {
+          "const": false
+        },
+        "properties": {
+          "type": "object",
+          "minProperties": 1
+        }
+      }
+    }
+  }
+}

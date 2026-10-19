@@ -1,0 +1,802 @@
+{
+  "name": "flag_conflict",
+  "description": "Record that two sources in the case contradict each other (e.g. a witness says 10:15 but the camera shows 10:41). Use it whenever you find a contradiction relevant to the question; never pick a side silently. Each claim must cite at least one source copied from earlier tool results. This is the only tool that writes: it stores one open conflict record for human review and returns its id, which you put in the answer's conflicts[].conflict_record_id.",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "description",
+      "claim_a",
+      "claim_b"
+    ],
+    "properties": {
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000,
+        "description": "What the contradiction is about."
+      },
+      "claim_a": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "text",
+          "source_refs"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "source_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "description": "A citable source: a chunk (copy chunk_id/evidence_id/locator from a search result) or a structured record (copy table/record_id/evidence_id from query_records sources).",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "source_type",
+                    "evidence_id",
+                    "chunk_id",
+                    "locator"
+                  ],
+                  "properties": {
+                    "source_type": {
+                      "const": "chunk"
+                    },
+                    "chunk_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "evidence_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "locator": {
+                      "description": "Where in the evidence the content is. Discriminated by `kind`.",
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Region of a PDF page.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "page"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "pdf"
+                            },
+                            "page": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based page number."
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in PDF points, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "ocr_confidence": {
+                              "type": [
+                                "number",
+                                "null"
+                              ],
+                              "minimum": 0,
+                              "maximum": 1,
+                              "description": "OCR confidence for scanned pages, null for born-digital text."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span of an audio recording.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms",
+                            "end_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "audio"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "speaker": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "description": "Diarized speaker label."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span, frame and optional box in a video.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "video"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "frame_idx": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in pixels, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "track_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Row of a structured table loaded from a CSV.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "table",
+                            "row_id"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "record"
+                            },
+                            "table": {
+                              "enum": [
+                                "call_records",
+                                "plate_reads",
+                                "custody_records"
+                              ]
+                            },
+                            "row_id": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based CSV data row."
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "source_type",
+                    "evidence_id",
+                    "table",
+                    "record_id",
+                    "locator"
+                  ],
+                  "properties": {
+                    "source_type": {
+                      "const": "record"
+                    },
+                    "table": {
+                      "enum": [
+                        "call_records",
+                        "plate_reads",
+                        "custody_records"
+                      ]
+                    },
+                    "record_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "evidence_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "locator": {
+                      "description": "Where in the evidence the content is. Discriminated by `kind`.",
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Region of a PDF page.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "page"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "pdf"
+                            },
+                            "page": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based page number."
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in PDF points, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "ocr_confidence": {
+                              "type": [
+                                "number",
+                                "null"
+                              ],
+                              "minimum": 0,
+                              "maximum": 1,
+                              "description": "OCR confidence for scanned pages, null for born-digital text."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span of an audio recording.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms",
+                            "end_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "audio"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "speaker": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "description": "Diarized speaker label."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span, frame and optional box in a video.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "video"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "frame_idx": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in pixels, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "track_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Row of a structured table loaded from a CSV.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "table",
+                            "row_id"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "record"
+                            },
+                            "table": {
+                              "enum": [
+                                "call_records",
+                                "plate_reads",
+                                "custody_records"
+                              ]
+                            },
+                            "row_id": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based CSV data row."
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "claim_b": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "text",
+          "source_refs"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "source_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "description": "A citable source: a chunk (copy chunk_id/evidence_id/locator from a search result) or a structured record (copy table/record_id/evidence_id from query_records sources).",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "source_type",
+                    "evidence_id",
+                    "chunk_id",
+                    "locator"
+                  ],
+                  "properties": {
+                    "source_type": {
+                      "const": "chunk"
+                    },
+                    "chunk_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "evidence_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "locator": {
+                      "description": "Where in the evidence the content is. Discriminated by `kind`.",
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Region of a PDF page.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "page"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "pdf"
+                            },
+                            "page": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based page number."
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in PDF points, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "ocr_confidence": {
+                              "type": [
+                                "number",
+                                "null"
+                              ],
+                              "minimum": 0,
+                              "maximum": 1,
+                              "description": "OCR confidence for scanned pages, null for born-digital text."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span of an audio recording.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms",
+                            "end_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "audio"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "speaker": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "description": "Diarized speaker label."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span, frame and optional box in a video.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "video"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "frame_idx": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in pixels, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "track_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Row of a structured table loaded from a CSV.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "table",
+                            "row_id"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "record"
+                            },
+                            "table": {
+                              "enum": [
+                                "call_records",
+                                "plate_reads",
+                                "custody_records"
+                              ]
+                            },
+                            "row_id": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based CSV data row."
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "source_type",
+                    "evidence_id",
+                    "table",
+                    "record_id",
+                    "locator"
+                  ],
+                  "properties": {
+                    "source_type": {
+                      "const": "record"
+                    },
+                    "table": {
+                      "enum": [
+                        "call_records",
+                        "plate_reads",
+                        "custody_records"
+                      ]
+                    },
+                    "record_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "evidence_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "locator": {
+                      "description": "Where in the evidence the content is. Discriminated by `kind`.",
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Region of a PDF page.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "page"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "pdf"
+                            },
+                            "page": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based page number."
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in PDF points, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "ocr_confidence": {
+                              "type": [
+                                "number",
+                                "null"
+                              ],
+                              "minimum": 0,
+                              "maximum": 1,
+                              "description": "OCR confidence for scanned pages, null for born-digital text."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span of an audio recording.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms",
+                            "end_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "audio"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "speaker": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "description": "Diarized speaker label."
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Time span, frame and optional box in a video.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "start_ms"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "video"
+                            },
+                            "start_ms": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "end_ms": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "frame_idx": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ],
+                              "minimum": 0
+                            },
+                            "bbox": {
+                              "type": [
+                                "array",
+                                "null"
+                              ],
+                              "description": "[x0, y0, x1, y1] in pixels, or null.",
+                              "items": {
+                                "type": "number"
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            },
+                            "track_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "description": "Row of a structured table loaded from a CSV.",
+                          "additionalProperties": false,
+                          "required": [
+                            "kind",
+                            "table",
+                            "row_id"
+                          ],
+                          "properties": {
+                            "kind": {
+                              "const": "record"
+                            },
+                            "table": {
+                              "enum": [
+                                "call_records",
+                                "plate_reads",
+                                "custody_records"
+                              ]
+                            },
+                            "row_id": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "1-based CSV data row."
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "conflict_id",
+      "status"
+    ],
+    "properties": {
+      "conflict_id": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "status": {
+        "const": "open"
+      }
+    }
+  }
+}

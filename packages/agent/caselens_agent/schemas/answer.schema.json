@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://caselens.dev/schemas/answer.schema.json",
+  "title": "CaseLens answer contract",
+  "description": "Structured answer produced by the investigator agent. Beyond this schema, the runtime answer validator enforces rules JSON Schema cannot express: (1) every citation_id in claims[] and conflicts[] must resolve to an entry in citations[] by id; (2) every citation must match a source actually returned by a tool call in the same run (chunk_id/record_id, evidence_id and locator); (3) any claim without a valid citation is rejected, and the agent must retry or answer with status 'insufficient_evidence'; (4) contradictory sources are surfaced in conflicts[] side by side and never silently resolved; (5) ids are unique within their array.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "answer",
+    "claims",
+    "citations",
+    "conflicts",
+    "confidence",
+    "open_questions"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "answered",
+        "insufficient_evidence"
+      ]
+    },
+    "answer": {
+      "type": "string",
+      "description": "Short prose summary of the answer."
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Claim"
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Citation"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Conflict"
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "const": "answered"
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "claims": {
+        "minItems": 1
+      }
+    }
+  },
+  "$defs": {
+    "Locator": {
+      "description": "Where in the evidence the cited content is. Discriminated by `kind`.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PdfLocator"
+        },
+        {
+          "$ref": "#/$defs/AudioLocator"
+        },
+        {
+          "$ref": "#/$defs/VideoLocator"
+        },
+        {
+          "$ref": "#/$defs/RecordLocator"
+        }
+      ]
+    },
+    "PdfLocator": {
+      "type": "object",
+      "description": "Region of a PDF page.",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "page"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pdf"
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based page number."
+        },
+        "bbox": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "[x0, y0, x1, y1] in PDF points, or null.",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "ocr_confidence": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "OCR confidence for scanned pages, null for born-digital text."
+        }
+      }
+    },
+    "AudioLocator": {
+      "type": "object",
+      "description": "Time span of an audio recording.",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "start_ms",
+        "end_ms"
+      ],
+      "properties": {
+        "kind": {
+          "const": "audio"
+        },
+        "start_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "speaker": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Diarized speaker label."
+        }
+      }
+    },
+    "VideoLocator": {
+      "type": "object",
+      "description": "Time span, frame and optional box in a video.",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "start_ms"
+      ],
+      "properties": {
+        "kind": {
+          "const": "video"
+        },
+        "start_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "frame_idx": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "bbox": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "[x0, y0, x1, y1] in pixels, or null.",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "track_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RecordLocator": {
+      "type": "object",
+      "description": "Row of a structured table loaded from a CSV.",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "table",
+        "row_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "record"
+        },
+        "table": {
+          "enum": [
+            "call_records",
+            "plate_reads",
+            "custody_records"
+          ]
+        },
+        "row_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based CSV data row."
+        }
+      }
+    },
+    "Citation": {
+      "type": "object",
+      "description": "One cited source. Chunk citations carry chunk_id; record citations carry table, record_id and a record locator.",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_type",
+        "evidence_id",
+        "locator"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^c[0-9]+$"
+        },
+        "source_type": {
+          "enum": [
+            "chunk",
+            "record"
+          ]
+        },
+        "evidence_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "chunk_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "table": {
+          "enum": [
+            "call_records",
+            "plate_reads",
+            "custody_records",
+            null
+          ]
+        },
+        "record_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "quote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000,
+          "description": "Exact supporting excerpt, when textual."
+        }
+      },
+      "if": {
+        "properties": {
+          "source_type": {
+            "const": "chunk"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "chunk_id"
+        ],
+        "properties": {
+          "chunk_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "table",
+          "record_id"
+        ],
+        "properties": {
+          "table": {
+            "enum": [
+              "call_records",
+              "plate_reads",
+              "custody_records"
+            ]
+          },
+          "record_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "locator": {
+            "$ref": "#/$defs/RecordLocator"
+          }
+        }
+      }
+    },
+    "Claim": {
+      "type": "object",
+      "description": "One factual statement; must cite at least one citation.",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "text",
+        "citation_ids"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^cl[0-9]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "citation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^c[0-9]+$"
+          }
+        },
+        "t_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the claimed fact starts, for the timeline."
+        },
+        "t_end": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "ConflictClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "citation_ids"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "citation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^c[0-9]+$"
+          }
+        }
+      }
+    },
+    "Conflict": {
+      "type": "object",
+      "description": "Two cited claims that contradict each other, shown side by side.",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "description",
+        "claim_a",
+        "claim_b"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^cf[0-9]+$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_a": {
+          "$ref": "#/$defs/ConflictClaim"
+        },
+        "claim_b": {
+          "$ref": "#/$defs/ConflictClaim"
+        },
+        "conflict_record_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "Id returned by flag_conflict, null if not stored."
+        }
+      }
+    }
+  }
+}

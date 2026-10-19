@@ -1,0 +1,2211 @@
+openapi: 3.1.0
+info:
+  title: CaseLens API
+  version: 0.1.0
+  summary: Evidence-search copilot API with cited, auditable answers.
+  description: |
+    CaseLens lets an investigator upload a mixed case file (PDF, audio, video, CSV) and ask
+    questions in plain English. Every answer is a cited, auditable timeline.
+
+    **All data served by this API in the demo deployment is SYNTHETIC.** The demo case
+    "The Riverside Lot Homicide" and every person, plate and phone number in it are fictional.
+
+    Key guarantees this contract encodes:
+
+    - **Citation or refuse.** `POST /v1/cases/{case_id}/ask` returns an `AnswerContract`. Every
+      claim carries at least one citation that resolves to a page+bbox, an audio timestamp, a
+      video frame, or a table row. If the evidence does not support an answer, the status is
+      `insufficient_evidence` instead of an uncited answer.
+    - **RBAC + RLS.** Access is per case, by member role (`lead` > `analyst` > `viewer`). The API
+      enforces the role, and Postgres row-level security enforces membership again as a second
+      wall. A caller who is not a member of a case gets `404` (case existence is not leaked); a
+      member whose role is too low gets `403`. The read-only demo user is a `viewer` on the demo
+      case. Viewers (including the demo user) get `403` on the mutating endpoints: case update,
+      member management (add, change role, remove), evidence upload, and entity-link revert.
+      Viewers MAY ask questions (`POST /v1/cases/{case_id}/ask`): that creates an agent run and
+      may store conflict records, which is allowed for every role.
+    - **Audit.** Every query, agent tool call, evidence view and mutation is written to an
+      append-only, hash-chained audit log, readable by the case lead.
+
+    Conventions: JSON is snake_case; IDs are UUIDs (audit entries use a 64-bit sequence);
+    timestamps are ISO-8601 `date-time`; errors are `application/problem+json` (RFC 9457);
+    list endpoints use opaque `cursor` + `limit` (max 100) pagination and return
+    `{items, next_cursor}`.
+  license:
+    name: Proprietary (portfolio project)
+    identifier: LicenseRef-CaseLens
+servers:
+  - url: http://localhost:8000
+    description: Local development (docker compose)
+security:
+  - bearerAuth: []
+tags:
+  - name: system
+    description: Liveness and version.
+  - name: me
+    description: The authenticated user.
+  - name: cases
+    description: Case workspaces.
+  - name: members
+    description: Per-case membership and roles.
+  - name: evidence
+    description: Evidence upload, metadata and content access.
+  - name: ingest
+    description: Ingest pipeline jobs and live progress.
+  - name: agent
+    description: Investigator agent questions and run traces.
+  - name: timeline
+    description: Case timeline of events.
+  - name: entities
+    description: Entities, mentions, merges and the case graph.
+  - name: conflicts
+    description: Conflicting claims surfaced from evidence.
+  - name: audit
+    description: Append-only, hash-chained audit log.
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: Liveness check
+      description: Unauthenticated liveness probe. Returns the service status and version.
+      security: []
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /v1/me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: Current user and case memberships
+      description: |
+        Returns the authenticated user and their case memberships. On first sign-in the user row
+        is created from the verified ID token. No case role required.
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/cases:
+    get:
+      tags: [cases]
+      operationId: listCases
+      summary: List cases the caller is a member of
+      description: Lists only cases where the caller holds any role (viewer or above).
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of cases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [cases]
+      operationId: createCase
+      summary: Create a case
+      description: |
+        Creates a case. The caller becomes its `lead`. The demo user cannot create cases (403).
+        Audited (`case.create`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseCreate'
+      responses:
+        '201':
+          description: The created case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Case'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [cases]
+      operationId: getCase
+      summary: Get a case
+      description: Required role viewer. Includes counts and demo-mode suggested questions.
+      responses:
+        '200':
+          description: The case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Case'
+              examples:
+                demoCase:
+                  summary: SYNTHETIC demo case
+                  value:
+                    id: 00000000-0000-4000-8000-0000000000c1
+                    name: The Riverside Lot Homicide (SYNTHETIC)
+                    description: Fictional demo case generated from a hidden ground-truth story.
+                    status: open
+                    is_demo: true
+                    created_by: 00000000-0000-4000-8000-0000000000a1
+                    created_at: '2026-03-20T09:00:00Z'
+                    updated_at: '2026-03-21T17:30:00Z'
+                    my_role: viewer
+                    evidence_count: 17
+                    last_activity_at: '2026-03-21T17:30:00Z'
+                    ingest_summary:
+                      queued: 0
+                      running: 0
+                      succeeded: 96
+                      failed: 0
+                      dead_lettered: 0
+                    suggested_questions:
+                      - Who was in the gray sedan on March 14?
+                      - Where was the gray sedan between 10 and 11pm on March 14?
+                      - How many calls were made between the suspect's phone and the victim's phone that night?
+                      - Do the witness statements agree on when the shots were heard?
+                      - What is the chain of custody for item E-07?
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [cases]
+      operationId: updateCase
+      summary: Update a case
+      description: |
+        Required role lead. Viewers (including the demo user) and analysts get 403.
+        Audited (`case.update`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseUpdate'
+      responses:
+        '200':
+          description: The updated case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Case'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [members]
+      operationId: listCaseMembers
+      summary: List case members
+      description: Required role viewer.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseMemberList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [members]
+      operationId: addCaseMember
+      summary: Add a member to a case
+      description: |
+        Required role lead (viewers, including the demo user, get 403). The user must already
+        exist (has signed in once); identify them by `user_id` or `email`. Returns 409 if they are already a member. Audited (`member.add`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseMemberCreate'
+      responses:
+        '201':
+          description: The new membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [members]
+      operationId: updateCaseMember
+      summary: Change a member's role
+      description: |
+        Required role lead (viewers, including the demo user, get 403). Returns 409 if the change
+        would leave the case without a lead.
+        Audited (`member.update`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseMemberUpdate'
+      responses:
+        '200':
+          description: The updated membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [members]
+      operationId: removeCaseMember
+      summary: Remove a member from a case
+      description: |
+        Required role lead (viewers, including the demo user, get 403). Returns 409 if it would
+        remove the last lead.
+        Audited (`member.remove`).
+      responses:
+        '204':
+          description: Membership removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/cases/{case_id}/evidence:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [evidence]
+      operationId: listEvidence
+      summary: List evidence in a case
+      description: Required role viewer. Optionally filter by modality.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: Only return evidence of this modality.
+          schema:
+            $ref: '#/components/schemas/EvidenceType'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of evidence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [evidence]
+      operationId: uploadEvidence
+      summary: Upload an evidence file
+      description: |
+        Required role analyst (lead or analyst); viewers, including the demo user, get 403. The
+        server computes SHA-256, stores the original immutably, records the first chain-of-custody
+        entry (the optional `description` becomes its `note`), and queues the ingest jobs for the
+        file's modality. The 201 response includes those jobs in `ingest_jobs`, each with status
+        `queued`. The optional `recorded_at` is the wall-clock start of an audio/video recording.
+        The modality is inferred from the content type. Returns 409 if a file with the same SHA-256 already exists in this
+        case. Audited (`evidence.upload`).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/EvidenceUpload'
+            encoding:
+              file:
+                contentType: application/pdf, audio/*, video/*, text/csv
+      responses:
+        '201':
+          description: The stored evidence; `ingest_jobs` lists the newly queued jobs (status `queued`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Evidence'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/evidence/{evidence_id}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/EvidenceId'
+    get:
+      tags: [evidence]
+      operationId: getEvidence
+      summary: Get evidence metadata
+      description: Required role viewer.
+      responses:
+        '200':
+          description: The evidence record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Evidence'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/cases/{case_id}/evidence/{evidence_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/EvidenceId'
+    get:
+      tags: [evidence]
+      operationId: getEvidenceContent
+      summary: Redirect to the original evidence file
+      description: |
+        Required role viewer. Re-verifies the stored object's SHA-256 against the recorded hash,
+        then redirects to a short-lived signed URL for the original. Returns 409 if the integrity
+        check fails (the file is never served in that case). Audited (`evidence.view`).
+      responses:
+        '307':
+          description: Temporary redirect to a short-lived signed URL.
+          headers:
+            Location:
+              description: Short-lived signed URL for the original file.
+              schema:
+                type: string
+                format: uri
+            Cache-Control:
+              description: Always `no-store`; signed URLs must not be cached.
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/cases/{case_id}/evidence/{evidence_id}/jobs:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/EvidenceId'
+    get:
+      tags: [ingest]
+      operationId: listEvidenceJobs
+      summary: List ingest jobs for one evidence file
+      description: Required role viewer. One job per `(evidence_id, stage)`, in pipeline order.
+      responses:
+        '200':
+          description: The evidence file's ingest jobs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestJobList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/cases/{case_id}/ingest/events:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [ingest]
+      operationId: streamIngestEvents
+      summary: Live ingest progress (Server-Sent Events)
+      description: |
+        Required role viewer. A `text/event-stream` of ingest progress for every evidence file in
+        the case. Clients send the bearer token in the `Authorization` header (use a fetch-based
+        SSE client; the browser `EventSource` cannot set headers).
+
+        Each message has an `id:` (monotonic per stream, usable as `Last-Event-ID` on reconnect),
+        an `event:` name and a `data:` line holding one JSON `IngestEvent`. Event names:
+
+        - `job.updated`: an ingest job changed status (`data.job` is set).
+        - `evidence.ready`: every stage for an evidence file succeeded.
+        - `evidence.failed`: a stage for an evidence file was dead-lettered.
+
+        A comment line (`: heartbeat`) is sent every 15 seconds to keep the connection open.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Resume after this event id.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: An open event stream. Each `data:` line is a JSON `IngestEvent`.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames; the JSON in each `data:` line follows `IngestEvent`.
+              example: |
+                id: 42
+                event: job.updated
+                data: {"event":"job.updated","case_id":"00000000-0000-4000-8000-0000000000c1","evidence_id":"00000000-0000-4000-8000-0000000000e1","job":{"id":"00000000-0000-4000-8000-0000000000b1","case_id":"00000000-0000-4000-8000-0000000000c1","evidence_id":"00000000-0000-4000-8000-0000000000e1","stage":"ocr","status":"running","attempts":1,"error":null,"started_at":"2026-03-20T09:01:00Z","finished_at":null,"created_at":"2026-03-20T09:00:05Z","updated_at":"2026-03-20T09:01:00Z"},"emitted_at":"2026-03-20T09:01:00Z"}
+          x-sse-payload:
+            $ref: '#/components/schemas/IngestEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/cases/{case_id}/ask:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    post:
+      tags: [agent]
+      operationId: askQuestion
+      summary: Ask the investigator agent a question
+      description: |
+        Required role viewer: every member may ask, including the read-only demo user. Asking
+        creates an agent run and may store conflict records (via `flag_conflict`); both are
+        allowed for viewers. Runs the agent loop
+        (at most 8 tool calls) over this case only; the case is bound from the path and is never a
+        tool input. Returns the completed run, whose `answer` is an `AnswerContract`. An
+        unsupported question yields `answer.status = insufficient_evidence`, not an error.
+        The question and every tool call are audited (`agent.ask`, `agent.tool_call`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskRequest'
+      responses:
+        '200':
+          description: The completed agent run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /v1/cases/{case_id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [agent]
+      operationId: listRuns
+      summary: List agent runs in a case
+      description: Required role viewer. Newest first.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of run summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRunList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [agent]
+      operationId: getRun
+      summary: Get an agent run with its full trace
+      description: |
+        Required role viewer. Returns the plan, every tool call (with the SQL that ran), latency,
+        token counts, cost and the answer.
+      responses:
+        '200':
+          description: The agent run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/cases/{case_id}/timeline:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [timeline]
+      operationId: getTimeline
+      summary: Case timeline
+      description: |
+        Required role viewer. Events ordered by `t_start`, each with the sources it came from.
+        Audited (`timeline.view`).
+      parameters:
+        - name: entity_id
+          in: query
+          required: false
+          description: Only events involving this entity.
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          required: false
+          description: Only events starting at or after this time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Only events starting at or before this time.
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of timeline events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelineEventList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/entities:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [entities]
+      operationId: listEntities
+      summary: List or search entities
+      description: Required role viewer. `q` is a fuzzy (trigram) match on the canonical name.
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: Only entities of this type.
+          schema:
+            $ref: '#/components/schemas/EntityType'
+        - name: q
+          in: query
+          required: false
+          description: Fuzzy name search.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of entities.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/entities/{entity_id}:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/EntityId'
+    get:
+      tags: [entities]
+      operationId: getEntity
+      summary: Get an entity with its mentions and links
+      description: Required role viewer.
+      responses:
+        '200':
+          description: The entity detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/cases/{case_id}/entity-links/{link_id}/revert:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/LinkId'
+    post:
+      tags: [entities]
+      operationId: revertEntityLink
+      summary: Revert an entity merge
+      description: |
+        Required role analyst (lead or analyst); viewers, including the demo user, get 403.
+        Splits a bad merge by setting the link's status to `reverted`; nothing is deleted. Returns 409 if the link is already reverted.
+        Audited (`entity_link.revert`).
+      responses:
+        '200':
+          description: The reverted link.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityLink'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/cases/{case_id}/graph:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [entities]
+      operationId: getGraph
+      summary: Case entity graph
+      description: |
+        Required role viewer. Nodes are entities; edges are active merge links (`same_as`) and
+        co-mentions in the same evidence chunk (`co_mention`).
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: Only include nodes of these entity types.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/EntityType'
+      responses:
+        '200':
+          description: The graph.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graph'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/conflicts:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [conflicts]
+      operationId: listConflicts
+      summary: List conflicting claims
+      description: Required role viewer. Newest first.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Only conflicts with this status.
+          schema:
+            $ref: '#/components/schemas/ConflictStatus'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of conflicts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConflictList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/cases/{case_id}/audit:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+    get:
+      tags: [audit]
+      operationId: listAuditEntries
+      summary: Read the case audit log
+      description: |
+        Required role lead. Entries in chain order (ascending `id`). Each entry carries
+        `payload_hash`, `prev_hash` and `row_hash`, so a client can re-verify the chain.
+        Reading the audit log is itself audited (`audit.view`).
+      parameters:
+        - name: action
+          in: query
+          required: false
+          description: Only entries with this action (for example `evidence.view`).
+          schema:
+            type: string
+            maxLength: 100
+        - name: user_id
+          in: query
+          required: false
+          description: Only entries by this user.
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          required: false
+          description: Only entries at or after this time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Only entries at or before this time.
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntryList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Firebase Auth ID token (OIDC), sent as `Authorization: Bearer <token>`."
+
+  parameters:
+    CaseId:
+      name: case_id
+      in: path
+      required: true
+      description: Case ID.
+      schema:
+        type: string
+        format: uuid
+    EvidenceId:
+      name: evidence_id
+      in: path
+      required: true
+      description: Evidence ID.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: User ID.
+      schema:
+        type: string
+        format: uuid
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      description: Agent run ID.
+      schema:
+        type: string
+        format: uuid
+    EntityId:
+      name: entity_id
+      in: path
+      required: true
+      description: Entity ID.
+      schema:
+        type: string
+        format: uuid
+    LinkId:
+      name: link_id
+      in: path
+      required: true
+      description: Entity link ID.
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous page's `next_cursor`.
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+  responses:
+    Unauthorized:
+      description: Missing, expired or invalid bearer token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Authenticated, but the caller's case role is too low for this action.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: The resource does not exist, or the caller is not a member of the case.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: The request conflicts with the current state of the resource.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationError:
+      description: The request is well-formed but fails validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: The uploaded file exceeds the size limit.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: The uploaded file's content type is not a supported modality.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded; retry later.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    # ---------- shared primitives and enums ----------
+    Uuid:
+      type: string
+      format: uuid
+    Sha256Hex:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Lowercase hex SHA-256 digest.
+    Role:
+      type: string
+      enum: [lead, analyst, viewer]
+      description: Case role. `lead` > `analyst` > `viewer`.
+    CaseStatus:
+      type: string
+      enum: [open, closed, archived]
+    EvidenceType:
+      type: string
+      enum: [pdf, audio, video, csv]
+    IngestJobStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, dead_lettered]
+    EntityType:
+      type: string
+      enum: [person, vehicle, phone, location, weapon]
+    EntityLinkMethod:
+      type: string
+      enum: [exact, fuzzy, llm, manual]
+    EntityLinkStatus:
+      type: string
+      enum: [active, reverted]
+    ConflictStatus:
+      type: string
+      enum: [open, reviewed]
+    AgentRunStatus:
+      type: string
+      enum: [running, succeeded, failed]
+    AnswerStatus:
+      type: string
+      enum: [answered, insufficient_evidence]
+    SourceType:
+      type: string
+      enum: [chunk, record]
+    RecordTable:
+      type: string
+      enum: [call_records, plate_reads, custody_records]
+    ToolName:
+      type: string
+      enum: [search_evidence, search_video, query_records, get_entity, get_timeline, flag_conflict]
+    BBox:
+      type: array
+      description: '[x0, y0, x1, y1].'
+      items:
+        type: number
+      minItems: 4
+      maxItems: 4
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details. Extension members are allowed.
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          default: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        errors:
+          type: array
+          description: Field-level validation errors (422 only).
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items:
+                  type: [string, integer]
+              msg:
+                type: string
+            required: [loc, msg]
+      required: [title, status]
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+      required: [status, version]
+
+    # ---------- users, cases, members ----------
+    User:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: [string, 'null']
+          format: email
+        display_name:
+          type: [string, 'null']
+        is_demo:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+      required: [id, email, display_name, is_demo, created_at]
+    Membership:
+      type: object
+      properties:
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        case_name:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+      required: [case_id, case_name, role]
+    Me:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        memberships:
+          type: array
+          items:
+            $ref: '#/components/schemas/Membership'
+      required: [user, memberships]
+    IngestSummary:
+      type: object
+      description: Count of ingest jobs in the case by status.
+      properties:
+        queued:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        succeeded:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        dead_lettered:
+          type: integer
+          minimum: 0
+      required: [queued, running, succeeded, failed, dead_lettered]
+    Case:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        description:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        is_demo:
+          type: boolean
+        created_by:
+          $ref: '#/components/schemas/Uuid'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        my_role:
+          $ref: '#/components/schemas/Role'
+        evidence_count:
+          type: integer
+          minimum: 0
+        last_activity_at:
+          type: [string, 'null']
+          format: date-time
+          description: Latest of upload, ingest update or agent run in the case.
+        ingest_summary:
+          $ref: '#/components/schemas/IngestSummary'
+        suggested_questions:
+          type: array
+          description: Demo-mode one-click questions. Empty for non-demo cases.
+          items:
+            type: string
+          maxItems: 10
+          examples:
+            - - Who was in the gray sedan on March 14?
+              - Where was the gray sedan between 10 and 11pm on March 14?
+              - How many calls were made between the suspect's phone and the victim's phone that night?
+              - Do the witness statements agree on when the shots were heard?
+              - What is the chain of custody for item E-07?
+      required:
+        - id
+        - name
+        - description
+        - status
+        - is_demo
+        - created_by
+        - created_at
+        - updated_at
+        - my_role
+        - evidence_count
+        - last_activity_at
+        - ingest_summary
+        - suggested_questions
+    CaseCreate:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+      required: [name]
+    CaseUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+    CaseMember:
+      type: object
+      properties:
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        user_id:
+          $ref: '#/components/schemas/Uuid'
+        role:
+          $ref: '#/components/schemas/Role'
+        email:
+          type: [string, 'null']
+          format: email
+        display_name:
+          type: [string, 'null']
+        added_by:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+      required: [case_id, user_id, role, email, display_name, added_by, created_at]
+    CaseMemberCreate:
+      type: object
+      additionalProperties: false
+      description: Identify the user by exactly one of `user_id` or `email`.
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+      required: [role]
+      oneOf:
+        - required: [user_id]
+        - required: [email]
+    CaseMemberUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+      required: [role]
+
+    # ---------- evidence and ingest ----------
+    EvidenceUpload:
+      type: object
+      additionalProperties: false
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          description: The evidence file (PDF, audio, video or CSV).
+        description:
+          type: string
+          maxLength: 2000
+          description: Optional note stored on the upload chain-of-custody entry.
+        recorded_at:
+          type: string
+          format: date-time
+          description: Optional wall-clock start of an audio/video recording, when known.
+      required: [file]
+    CustodyEntry:
+      type: object
+      description: One chain-of-custody entry. Entries are append-only.
+      properties:
+        at:
+          type: string
+          format: date-time
+        action:
+          type: string
+          description: What happened, for example `uploaded`.
+          examples: [uploaded]
+        actor_user_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        sha256:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256Hex'
+            - type: 'null'
+        note:
+          type: [string, 'null']
+      required: [at, action, actor_user_id, sha256, note]
+    IngestJob:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        stage:
+          type: string
+          description: |
+            Pipeline stage. pdf: parse, layout, chunk, embed, extract; scanned pdf: render, ocr,
+            ocr_check, chunk, embed, extract; audio: normalize, asr, diarize, segment, embed,
+            extract; video: scene_detect, keyframes, detect, track, caption, embed; csv:
+            schema_infer, validate, load, register.
+          examples: [ocr]
+        status:
+          $ref: '#/components/schemas/IngestJobStatus'
+        attempts:
+          type: integer
+          minimum: 0
+        error:
+          type: [string, 'null']
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - case_id
+        - evidence_id
+        - stage
+        - status
+        - attempts
+        - error
+        - started_at
+        - finished_at
+        - created_at
+        - updated_at
+    IngestEvent:
+      type: object
+      description: |
+        Payload of one SSE `data:` line on `GET /v1/cases/{case_id}/ingest/events`. The SSE
+        `event:` name equals the `event` field: `job.updated`, `evidence.ready` or
+        `evidence.failed`.
+      properties:
+        event:
+          type: string
+          enum: [job.updated, evidence.ready, evidence.failed]
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        job:
+          description: The changed job for `job.updated`; null otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/IngestJob'
+            - type: 'null'
+        emitted_at:
+          type: string
+          format: date-time
+      required: [event, case_id, evidence_id, job, emitted_at]
+    Evidence:
+      type: object
+      description: |
+        An immutable evidence file. The storage URI is never exposed; use the `content` endpoint.
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          $ref: '#/components/schemas/EvidenceType'
+        original_filename:
+          type: string
+        content_type:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        uploaded_by:
+          $ref: '#/components/schemas/Uuid'
+        chain_of_custody:
+          type: array
+          items:
+            $ref: '#/components/schemas/CustodyEntry'
+        recorded_at:
+          type: [string, 'null']
+          format: date-time
+          description: Wall-clock start of an audio/video recording when known; otherwise null.
+        ingest_jobs:
+          type: array
+          description: Current ingest jobs for this file, in pipeline order.
+          items:
+            $ref: '#/components/schemas/IngestJob'
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - case_id
+        - type
+        - original_filename
+        - content_type
+        - size_bytes
+        - sha256
+        - uploaded_by
+        - chain_of_custody
+        - recorded_at
+        - ingest_jobs
+        - created_at
+
+    # ---------- locators and source refs ----------
+    PdfLocator:
+      type: object
+      additionalProperties: false
+      properties:
+        kind:
+          const: pdf
+        page:
+          type: integer
+          minimum: 1
+        bbox:
+          description: Bounding box in PDF points, or null for a whole-page citation.
+          oneOf:
+            - $ref: '#/components/schemas/BBox'
+            - type: 'null'
+        ocr_confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+      required: [kind, page]
+    AudioLocator:
+      type: object
+      additionalProperties: false
+      properties:
+        kind:
+          const: audio
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: integer
+          minimum: 0
+        speaker:
+          type: [string, 'null']
+      required: [kind, start_ms, end_ms]
+    VideoLocator:
+      type: object
+      additionalProperties: false
+      properties:
+        kind:
+          const: video
+        start_ms:
+          type: integer
+          minimum: 0
+        end_ms:
+          type: [integer, 'null']
+          minimum: 0
+        frame_idx:
+          type: [integer, 'null']
+          minimum: 0
+        bbox:
+          description: Bounding box in pixels, or null.
+          oneOf:
+            - $ref: '#/components/schemas/BBox'
+            - type: 'null'
+        track_id:
+          type: [string, 'null']
+      required: [kind, start_ms]
+    RecordLocator:
+      type: object
+      additionalProperties: false
+      properties:
+        kind:
+          const: record
+        table:
+          $ref: '#/components/schemas/RecordTable'
+        row_id:
+          type: integer
+          minimum: 0
+      required: [kind, table, row_id]
+    Locator:
+      description: Where in the evidence a source sits, discriminated by `kind`.
+      oneOf:
+        - $ref: '#/components/schemas/PdfLocator'
+        - $ref: '#/components/schemas/AudioLocator'
+        - $ref: '#/components/schemas/VideoLocator'
+        - $ref: '#/components/schemas/RecordLocator'
+      discriminator:
+        propertyName: kind
+        mapping:
+          pdf: '#/components/schemas/PdfLocator'
+          audio: '#/components/schemas/AudioLocator'
+          video: '#/components/schemas/VideoLocator'
+          record: '#/components/schemas/RecordLocator'
+    ChunkSourceRef:
+      type: object
+      additionalProperties: false
+      properties:
+        source_type:
+          const: chunk
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        chunk_id:
+          $ref: '#/components/schemas/Uuid'
+        locator:
+          $ref: '#/components/schemas/Locator'
+      required: [source_type, evidence_id, chunk_id, locator]
+    RecordSourceRef:
+      type: object
+      additionalProperties: false
+      properties:
+        source_type:
+          const: record
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        table:
+          $ref: '#/components/schemas/RecordTable'
+        record_id:
+          $ref: '#/components/schemas/Uuid'
+        locator:
+          $ref: '#/components/schemas/Locator'
+      required: [source_type, evidence_id, table, record_id, locator]
+    SourceRef:
+      description: |
+        A pointer to supporting evidence: a chunk (`chunk_id`) or a structured row (`table` +
+        `record_id`), always with `evidence_id` and `locator`. Discriminated by `source_type`.
+      oneOf:
+        - $ref: '#/components/schemas/ChunkSourceRef'
+        - $ref: '#/components/schemas/RecordSourceRef'
+      discriminator:
+        propertyName: source_type
+        mapping:
+          chunk: '#/components/schemas/ChunkSourceRef'
+          record: '#/components/schemas/RecordSourceRef'
+
+    # ---------- answer contract ----------
+    Claim:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          pattern: '^cl[0-9]+$'
+        text:
+          type: string
+          minLength: 1
+        citation_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^c[0-9]+$'
+        t_start:
+          type: [string, 'null']
+          format: date-time
+        t_end:
+          type: [string, 'null']
+          format: date-time
+      required: [id, text, citation_ids]
+    Citation:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          pattern: '^c[0-9]+$'
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        chunk_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        table:
+          oneOf:
+            - $ref: '#/components/schemas/RecordTable'
+            - type: 'null'
+        record_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        locator:
+          $ref: '#/components/schemas/Locator'
+        quote:
+          type: [string, 'null']
+      required: [id, source_type, evidence_id, locator]
+    ConflictSide:
+      type: object
+      additionalProperties: false
+      properties:
+        text:
+          type: string
+          minLength: 1
+        citation_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^c[0-9]+$'
+      required: [text, citation_ids]
+    Conflict:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          pattern: '^cf[0-9]+$'
+        description:
+          type: string
+        claim_a:
+          $ref: '#/components/schemas/ConflictSide'
+        claim_b:
+          $ref: '#/components/schemas/ConflictSide'
+        conflict_record_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+      required: [id, description, claim_a, claim_b]
+    AnswerContract:
+      type: object
+      additionalProperties: false
+      description: |
+        The agent's structured answer (mirrors
+        `packages/agent/caselens_agent/schemas/answer.schema.json`). When `status` is `answered`,
+        `claims` has at least one entry. Every `citation_ids` entry in `claims` and `conflicts`
+        must resolve to an `id` in `citations`; JSON Schema cannot express that, so the runtime
+        answer validator enforces it and rejects the answer otherwise.
+      properties:
+        status:
+          $ref: '#/components/schemas/AnswerStatus'
+        answer:
+          type: string
+        claims:
+          type: array
+          items:
+            $ref: '#/components/schemas/Claim'
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Conflict'
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        open_questions:
+          type: array
+          items:
+            type: string
+      required: [status, answer, claims, citations, conflicts, confidence, open_questions]
+      if:
+        properties:
+          status:
+            const: answered
+      then:
+        properties:
+          claims:
+            minItems: 1
+
+    # ---------- agent runs ----------
+    AskRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          examples: ["Who was in the gray sedan on March 14?"]
+      required: [question]
+    ToolCall:
+      type: object
+      properties:
+        name:
+          $ref: '#/components/schemas/ToolName'
+        input:
+          type: object
+          description: The tool input as sent by the agent (validated against the tool schema).
+        output_summary:
+          type: string
+          description: Short summary of the tool output (for the trace drawer).
+        sql:
+          type: [string, 'null']
+          description: Parameterized SQL that ran (`query_records` only).
+        latency_ms:
+          type: integer
+          minimum: 0
+        error:
+          type: [string, 'null']
+      required: [name, input, output_summary, sql, latency_ms, error]
+    AgentRun:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        user_id:
+          $ref: '#/components/schemas/Uuid'
+        question:
+          type: string
+        status:
+          $ref: '#/components/schemas/AgentRunStatus'
+        model:
+          type: [string, 'null']
+        plan:
+          type: [array, 'null']
+          description: The agent's plan steps, in order.
+          items:
+            type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        answer:
+          description: The answer contract; null while running or if the run failed.
+          oneOf:
+            - $ref: '#/components/schemas/AnswerContract'
+            - type: 'null'
+        latency_ms:
+          type: [integer, 'null']
+          minimum: 0
+        input_tokens:
+          type: [integer, 'null']
+          minimum: 0
+        output_tokens:
+          type: [integer, 'null']
+          minimum: 0
+        cost_usd:
+          type: [number, 'null']
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - case_id
+        - user_id
+        - question
+        - status
+        - model
+        - plan
+        - tool_calls
+        - answer
+        - latency_ms
+        - input_tokens
+        - output_tokens
+        - cost_usd
+        - created_at
+    AgentRunSummary:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        user_id:
+          $ref: '#/components/schemas/Uuid'
+        question:
+          type: string
+        status:
+          $ref: '#/components/schemas/AgentRunStatus'
+        answer_status:
+          oneOf:
+            - $ref: '#/components/schemas/AnswerStatus'
+            - type: 'null'
+        model:
+          type: [string, 'null']
+        latency_ms:
+          type: [integer, 'null']
+          minimum: 0
+        cost_usd:
+          type: [number, 'null']
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+      required: [id, user_id, question, status, answer_status, model, latency_ms, cost_usd, created_at]
+
+    # ---------- timeline ----------
+    TimelineSource:
+      type: object
+      properties:
+        chunk_id:
+          $ref: '#/components/schemas/Uuid'
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        locator:
+          $ref: '#/components/schemas/Locator'
+      required: [chunk_id, evidence_id, locator]
+    EventLocation:
+      type: object
+      properties:
+        entity_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+      required: [entity_id, name]
+    TimelineEvent:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        t_start:
+          type: string
+          format: date-time
+        t_end:
+          type: [string, 'null']
+          format: date-time
+        location:
+          oneOf:
+            - $ref: '#/components/schemas/EventLocation'
+            - type: 'null'
+        description:
+          type: string
+        confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        needs_review:
+          type: boolean
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineSource'
+      required: [id, t_start, t_end, location, description, confidence, needs_review, sources]
+
+    # ---------- entities and graph ----------
+    Entity:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          $ref: '#/components/schemas/EntityType'
+        canonical_name:
+          type: string
+        normalized_key:
+          type: [string, 'null']
+          description: Normalized plate (uppercase, no spaces) or E.164 phone number.
+        attributes:
+          type: object
+        mention_count:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+      required: [id, case_id, type, canonical_name, normalized_key, attributes, mention_count, created_at]
+    Mention:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        entity_id:
+          $ref: '#/components/schemas/Uuid'
+        chunk_id:
+          $ref: '#/components/schemas/Uuid'
+        evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        surface_text:
+          type: string
+        confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        needs_review:
+          type: boolean
+        locator:
+          $ref: '#/components/schemas/Locator'
+        created_at:
+          type: string
+          format: date-time
+      required:
+        - id
+        - entity_id
+        - chunk_id
+        - evidence_id
+        - surface_text
+        - confidence
+        - needs_review
+        - locator
+        - created_at
+    EntityLink:
+      type: object
+      description: A reversible `same_as` merge between two entities.
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        from_entity_id:
+          $ref: '#/components/schemas/Uuid'
+        to_entity_id:
+          $ref: '#/components/schemas/Uuid'
+        method:
+          $ref: '#/components/schemas/EntityLinkMethod'
+        confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        status:
+          $ref: '#/components/schemas/EntityLinkStatus'
+        created_by:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+        reverted_at:
+          type: [string, 'null']
+          format: date-time
+        reverted_by:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+      required:
+        - id
+        - case_id
+        - from_entity_id
+        - to_entity_id
+        - method
+        - confidence
+        - status
+        - created_by
+        - created_at
+        - reverted_at
+        - reverted_by
+    EntityDetail:
+      description: An entity with its aliases, mentions and merge links (active and reverted).
+      allOf:
+        - $ref: '#/components/schemas/Entity'
+        - type: object
+          properties:
+            aliases:
+              type: array
+              items:
+                type: string
+            mentions:
+              type: array
+              items:
+                $ref: '#/components/schemas/Mention'
+            links:
+              type: array
+              items:
+                $ref: '#/components/schemas/EntityLink'
+          required: [aliases, mentions, links]
+    GraphNode:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          $ref: '#/components/schemas/EntityType'
+        label:
+          type: string
+        mention_count:
+          type: integer
+          minimum: 0
+      required: [id, type, label, mention_count]
+    GraphEdge:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Stable edge id (the link id for `same_as` edges).
+        source:
+          $ref: '#/components/schemas/Uuid'
+        target:
+          $ref: '#/components/schemas/Uuid'
+        kind:
+          type: string
+          enum: [same_as, co_mention]
+        weight:
+          type: number
+          minimum: 0
+        link_id:
+          description: The entity link for `same_as` edges; null for `co_mention`.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+      required: [id, source, target, kind, weight, link_id]
+    Graph:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdge'
+      required: [nodes, edges]
+
+    # ---------- conflicts ----------
+    ConflictClaim:
+      type: object
+      properties:
+        text:
+          type: string
+        source_refs:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SourceRef'
+      required: [text, source_refs]
+    ConflictRecord:
+      type: object
+      description: A stored conflict between two claims (created by the `flag_conflict` tool).
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        case_id:
+          $ref: '#/components/schemas/Uuid'
+        agent_run_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        description:
+          type: string
+        claim_a:
+          $ref: '#/components/schemas/ConflictClaim'
+        claim_b:
+          $ref: '#/components/schemas/ConflictClaim'
+        status:
+          $ref: '#/components/schemas/ConflictStatus'
+        created_at:
+          type: string
+          format: date-time
+      required: [id, case_id, agent_run_id, description, claim_a, claim_b, status, created_at]
+
+    # ---------- audit ----------
+    AuditEntry:
+      type: object
+      description: |
+        One append-only, hash-chained audit row. `payload_hash = sha256(payload::text)`;
+        `row_hash = sha256(prev_hash || user_id || case_id || action || payload_hash || ts)`;
+        the first row's `prev_hash` is 64 zeros. Actions include `case.create`, `case.update`,
+        `member.add`, `member.update`, `member.remove`, `evidence.upload`, `evidence.view`,
+        `agent.ask`, `agent.tool_call`, `timeline.view`, `entity_link.revert`, `audit.view`.
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        ts:
+          type: string
+          format: date-time
+        user_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        case_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        action:
+          type: string
+          examples: [evidence.view]
+        payload:
+          type: object
+        payload_hash:
+          $ref: '#/components/schemas/Sha256Hex'
+        prev_hash:
+          $ref: '#/components/schemas/Sha256Hex'
+        row_hash:
+          $ref: '#/components/schemas/Sha256Hex'
+      required: [id, ts, user_id, case_id, action, payload, payload_hash, prev_hash, row_hash]
+
+    # ---------- paginated lists ----------
+    NextCursor:
+      type: [string, 'null']
+      description: Pass as `cursor` to get the next page; null on the last page.
+    CaseList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Case'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    CaseMemberList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseMember'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    EvidenceList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    IngestJobList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestJob'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    AgentRunList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentRunSummary'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    TimelineEventList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineEvent'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    EntityList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Entity'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    ConflictList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConflictRecord'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]
+    AuditEntryList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+      required: [items, next_cursor]

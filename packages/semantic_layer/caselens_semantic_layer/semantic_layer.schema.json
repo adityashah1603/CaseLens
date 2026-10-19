@@ -1,0 +1,265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://caselens.dev/schemas/semantic_layer.schema.json",
+  "title": "CaseLens semantic layer",
+  "description": "Validates semantic_layer.yaml. The layer is fully declarative: filters are structured predicates over declared columns, never raw SQL. The compiler always injects the case_id predicate and runs on the read-only role. Cross-references (columns exist, params declared) are checked by tests and the compiler.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "defaults", "param_types", "sources", "joins", "metrics", "operations"],
+  "properties": {
+    "version": {"const": 1},
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "max_rows", "statement_timeout_ms"],
+      "properties": {
+        "role": {"const": "caselens_readonly"},
+        "max_rows": {"type": "integer", "minimum": 1, "maximum": 500},
+        "statement_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 5000}
+      }
+    },
+    "param_types": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["base", "description", "normalization"],
+        "properties": {
+          "base": {"enum": ["string", "integer", "number"]},
+          "description": {"type": "string", "minLength": 1},
+          "normalization": {"type": "string", "minLength": 1},
+          "pattern": {"type": "string", "format": "regex"},
+          "format": {"enum": ["date-time"]},
+          "max_length": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/source"}
+    },
+    "joins": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "additionalProperties": {"$ref": "#/$defs/join"}
+    },
+    "metrics": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "additionalProperties": {"$ref": "#/$defs/metric"}
+    },
+    "operations": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/identifier"},
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/operation"}
+    }
+  },
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+    "column_type": {
+      "enum": ["uuid", "text", "integer", "double", "numeric", "boolean", "timestamptz", "jsonb"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["table", "description", "primary_key", "case_column", "citation", "columns"],
+      "properties": {
+        "table": {"enum": ["call_records", "plate_reads", "custody_records", "entities"]},
+        "description": {"type": "string", "minLength": 1},
+        "primary_key": {"$ref": "#/$defs/identifier"},
+        "case_column": {"$ref": "#/$defs/identifier"},
+        "citation": {
+          "description": "How a returned row becomes a record citation (Locator kind=record). null means rows of this source are not citable on their own.",
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["table", "record_id_column", "evidence_id_column", "row_id_column"],
+              "properties": {
+                "table": {"enum": ["call_records", "plate_reads", "custody_records"]},
+                "record_id_column": {"$ref": "#/$defs/identifier"},
+                "evidence_id_column": {"$ref": "#/$defs/identifier"},
+                "row_id_column": {"$ref": "#/$defs/identifier"}
+              }
+            }
+          ]
+        },
+        "columns": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "description"],
+            "properties": {
+              "type": {"$ref": "#/$defs/column_type"},
+              "param_type": {"$ref": "#/$defs/identifier"},
+              "description": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "column_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "column"],
+      "properties": {
+        "source": {"$ref": "#/$defs/identifier"},
+        "column": {"$ref": "#/$defs/identifier"}
+      }
+    },
+    "constant_predicate": {
+      "description": "Predicate against a literal constant defined in this file (never from the LLM).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "op", "value"],
+      "properties": {
+        "column": {"$ref": "#/$defs/identifier"},
+        "op": {"const": "eq"},
+        "value": {"type": ["string", "integer", "boolean"]}
+      }
+    },
+    "join": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "from", "to"],
+      "properties": {
+        "description": {"type": "string", "minLength": 1},
+        "from": {"$ref": "#/$defs/column_ref"},
+        "to": {"$ref": "#/$defs/column_ref"},
+        "to_filters": {"type": "array", "items": {"$ref": "#/$defs/constant_predicate"}}
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "source", "aggregate"],
+      "properties": {
+        "description": {"type": "string", "minLength": 1},
+        "source": {"$ref": "#/$defs/identifier"},
+        "aggregate": {"enum": ["count", "count_distinct", "sum", "min", "max"]},
+        "column": {
+          "$ref": "#/$defs/identifier",
+          "description": "Column to aggregate; omitted for count, which counts rows."
+        }
+      },
+      "if": {"properties": {"aggregate": {"const": "count"}}},
+      "then": {"not": {"required": ["column"]}},
+      "else": {"required": ["column"]}
+    },
+    "predicate": {
+      "description": "Structured predicate binding one operation param (or two for between) to a column.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column", "op", "param"],
+          "properties": {
+            "column": {"$ref": "#/$defs/identifier"},
+            "op": {"enum": ["eq", "in", "gte", "lte", "ilike"]},
+            "param": {"$ref": "#/$defs/identifier"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column", "op", "params"],
+          "properties": {
+            "column": {"$ref": "#/$defs/identifier"},
+            "op": {"const": "between"},
+            "params": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/identifier"},
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        }
+      ]
+    },
+    "all_of_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["all_of"],
+      "properties": {
+        "all_of": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/predicate"}}
+      }
+    },
+    "any_of_group": {
+      "description": "OR of predicates or AND-groups, e.g. either-direction phone match.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["any_of"],
+      "properties": {
+        "any_of": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "oneOf": [{"$ref": "#/$defs/predicate"}, {"$ref": "#/$defs/all_of_group"}]
+          }
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "source", "params", "filters"],
+      "properties": {
+        "description": {"type": "string", "minLength": 20},
+        "source": {"$ref": "#/$defs/identifier"},
+        "params": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "required", "description"],
+            "properties": {
+              "type": {"$ref": "#/$defs/identifier"},
+              "required": {"type": "boolean"},
+              "description": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "filters": {
+          "description": "Top-level filters are ANDed. The case_id predicate is always injected by the compiler and must not appear here.",
+          "type": "array",
+          "items": {
+            "oneOf": [{"$ref": "#/$defs/predicate"}, {"$ref": "#/$defs/any_of_group"}]
+          }
+        },
+        "select": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/identifier"}
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["column", "direction"],
+            "properties": {
+              "column": {"$ref": "#/$defs/identifier"},
+              "direction": {"enum": ["asc", "desc"]}
+            }
+          }
+        },
+        "metric": {"$ref": "#/$defs/identifier"}
+      },
+      "oneOf": [
+        {"required": ["select"], "not": {"required": ["metric"]}},
+        {"required": ["metric"], "not": {"anyOf": [{"required": ["select"]}, {"required": ["order_by"]}]}}
+      ]
+    }
+  }
+}

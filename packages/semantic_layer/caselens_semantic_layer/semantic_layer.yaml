@@ -1,0 +1,266 @@
+# SYNTHETIC data only; contract — changes need tech-lead approval.
+#
+# CaseLens semantic layer. The LLM never writes SQL: it picks one `operation` below (through the
+# `query_records` agent tool) and supplies `params`. A compiler turns the operation into
+# parameterized SQL and runs it on the read-only role with the limits in `defaults`.
+#
+# Rules the compiler enforces (not repeated per operation):
+#   * A `case_id = :case_id` predicate on the source's `case_column` is ALWAYS injected. The case
+#     id is bound by the runtime from the request; it is never an operation param.
+#   * Every filter is a structured predicate {column, op, param | params}. There are no raw SQL
+#     fragments anywhere in this file; columns and ops are checked against this file.
+#   * Params are normalized per `param_types` before binding, then bound as query parameters.
+#   * `ilike` params are escaped (% and _) and wrapped as a contains-match (%value%).
+#   * Results are capped at `defaults.max_rows`; the result reports `truncated: true` if capped.
+#   * Each returned row is cited through the source's `citation` columns.
+version: 1
+
+defaults:
+  role: caselens_readonly
+  max_rows: 500
+  statement_timeout_ms: 5000
+
+param_types:
+  phone:
+    base: string
+    description: Phone number.
+    normalization: >-
+      Strip spaces, dots, dashes and parentheses; assume +1 when 10 digits are given; result is
+      E.164 (e.g. +15550101234).
+    pattern: "^\\+[1-9][0-9]{6,14}$"
+  plate:
+    base: string
+    description: Vehicle licence plate.
+    normalization: Uppercase; remove spaces and hyphens (e.g. "7abc 123" becomes 7ABC123).
+    pattern: "^[A-Z0-9]{1,10}$"
+  timestamp:
+    base: string
+    format: date-time
+    description: Point in time.
+    normalization: ISO-8601 / RFC 3339 with a UTC offset; compared as timestamptz.
+  string:
+    base: string
+    description: Free text value.
+    normalization: Trim surrounding whitespace; must be 1 to 200 characters.
+    max_length: 200
+
+sources:
+  call_records:
+    table: call_records
+    description: Phone call and SMS detail records loaded from carrier CSV exports.
+    primary_key: id
+    case_column: case_id
+    citation:
+      table: call_records
+      record_id_column: id
+      evidence_id_column: evidence_id
+      row_id_column: row_id
+    columns:
+      id: {type: uuid, description: Record id.}
+      case_id: {type: uuid, description: Owning case (injected filter only).}
+      evidence_id: {type: uuid, description: Source CSV evidence item.}
+      row_id: {type: integer, description: 1-based data row number in the source CSV.}
+      caller_number: {type: text, param_type: phone, description: Originating number (E.164).}
+      callee_number: {type: text, param_type: phone, description: Receiving number (E.164).}
+      started_at: {type: timestamptz, description: Call or message start time.}
+      duration_s: {type: integer, description: Call duration in seconds (0 for SMS).}
+      call_type: {type: text, description: voice or sms.}
+      cell_tower_id: {type: text, description: "Serving cell tower id, may be null."}
+
+  plate_reads:
+    table: plate_reads
+    description: Automatic licence plate reader (ALPR) hits loaded from CSV exports.
+    primary_key: id
+    case_column: case_id
+    citation:
+      table: plate_reads
+      record_id_column: id
+      evidence_id_column: evidence_id
+      row_id_column: row_id
+    columns:
+      id: {type: uuid, description: Record id.}
+      case_id: {type: uuid, description: Owning case (injected filter only).}
+      evidence_id: {type: uuid, description: Source CSV evidence item.}
+      row_id: {type: integer, description: 1-based data row number in the source CSV.}
+      plate: {type: text, param_type: plate, description: Normalized plate text.}
+      plate_state: {type: text, description: Issuing state or province.}
+      read_at: {type: timestamptz, description: Time of the camera read.}
+      camera_id: {type: text, description: ALPR camera id.}
+      location_name: {type: text, description: Human-readable camera location.}
+      latitude: {type: double, description: Camera latitude.}
+      longitude: {type: double, description: Camera longitude.}
+      confidence: {type: numeric, description: "OCR confidence of the plate read, 0 to 1."}
+
+  custody_records:
+    table: custody_records
+    description: Physical evidence log (chain of custody) loaded from the evidence-log CSV.
+    primary_key: id
+    case_column: case_id
+    citation:
+      table: custody_records
+      record_id_column: id
+      evidence_id_column: evidence_id
+      row_id_column: row_id
+    columns:
+      id: {type: uuid, description: Record id.}
+      case_id: {type: uuid, description: Owning case (injected filter only).}
+      evidence_id: {type: uuid, description: Source CSV evidence item.}
+      row_id: {type: integer, description: 1-based data row number in the source CSV.}
+      item_id: {type: text, description: Physical item tag (e.g. ITEM-007).}
+      description: {type: text, description: Item description.}
+      collected_by: {type: text, description: Collecting officer.}
+      collected_at: {type: timestamptz, description: Collection time.}
+      collected_location: {type: text, description: Where the item was collected.}
+      custody_chain: {type: text, description: Recorded hand-offs of the item.}
+
+  entities:
+    table: entities
+    description: >-
+      Resolved case entities. Used for joins from records to people, vehicles and phones; entity
+      rows are not citable evidence on their own.
+    primary_key: id
+    case_column: case_id
+    citation: null
+    columns:
+      id: {type: uuid, description: Entity id.}
+      case_id: {type: uuid, description: Owning case (injected filter only).}
+      type: {type: text, description: "person, vehicle, phone, location or weapon."}
+      canonical_name: {type: text, description: Display name of the entity.}
+      normalized_key: {type: text, description: "Normalized plate or E.164 phone, may be null."}
+      attributes: {type: jsonb, description: Free-form entity attributes.}
+      created_at: {type: timestamptz, description: Creation time.}
+
+joins:
+  plate_read_vehicle:
+    description: Link a plate read to its vehicle entity.
+    from: {source: plate_reads, column: plate}
+    to: {source: entities, column: normalized_key}
+    to_filters:
+      - {column: type, op: eq, value: vehicle}
+  call_caller_phone:
+    description: Link a call record's caller number to its phone entity.
+    from: {source: call_records, column: caller_number}
+    to: {source: entities, column: normalized_key}
+    to_filters:
+      - {column: type, op: eq, value: phone}
+  call_callee_phone:
+    description: Link a call record's callee number to its phone entity.
+    from: {source: call_records, column: callee_number}
+    to: {source: entities, column: normalized_key}
+    to_filters:
+      - {column: type, op: eq, value: phone}
+
+metrics:
+  call_count:
+    description: Number of call records (voice and SMS) matching the operation's filters.
+    source: call_records
+    aggregate: count
+
+operations:
+  calls_between:
+    description: >-
+      List calls and texts between two phone numbers in either direction within a time window,
+      oldest first. Use to establish contact between two people's phones.
+    source: call_records
+    params:
+      phone_a: {type: phone, required: true, description: First phone number.}
+      phone_b: {type: phone, required: true, description: Second phone number.}
+      window_start: {type: timestamp, required: true, description: Window start (inclusive).}
+      window_end: {type: timestamp, required: true, description: Window end (inclusive).}
+    filters:
+      - any_of:
+          - all_of:
+              - {column: caller_number, op: eq, param: phone_a}
+              - {column: callee_number, op: eq, param: phone_b}
+          - all_of:
+              - {column: caller_number, op: eq, param: phone_b}
+              - {column: callee_number, op: eq, param: phone_a}
+      - {column: started_at, op: between, params: [window_start, window_end]}
+    select: [caller_number, callee_number, started_at, duration_s, call_type, cell_tower_id]
+    order_by:
+      - {column: started_at, direction: asc}
+
+  calls_for_phone:
+    description: >-
+      List every call and text to or from one phone number within a time window, oldest first.
+      Use to see who a phone was in contact with.
+    source: call_records
+    params:
+      phone: {type: phone, required: true, description: Phone number of interest.}
+      window_start: {type: timestamp, required: true, description: Window start (inclusive).}
+      window_end: {type: timestamp, required: true, description: Window end (inclusive).}
+    filters:
+      - any_of:
+          - {column: caller_number, op: eq, param: phone}
+          - {column: callee_number, op: eq, param: phone}
+      - {column: started_at, op: between, params: [window_start, window_end]}
+    select: [caller_number, callee_number, started_at, duration_s, call_type, cell_tower_id]
+    order_by:
+      - {column: started_at, direction: asc}
+
+  call_count_between:
+    description: >-
+      Count calls and texts between two phone numbers in either direction within a time window.
+      Use for "how many times did A and B talk" questions; returns one row with call_count.
+    source: call_records
+    params:
+      phone_a: {type: phone, required: true, description: First phone number.}
+      phone_b: {type: phone, required: true, description: Second phone number.}
+      window_start: {type: timestamp, required: true, description: Window start (inclusive).}
+      window_end: {type: timestamp, required: true, description: Window end (inclusive).}
+    filters:
+      - any_of:
+          - all_of:
+              - {column: caller_number, op: eq, param: phone_a}
+              - {column: callee_number, op: eq, param: phone_b}
+          - all_of:
+              - {column: caller_number, op: eq, param: phone_b}
+              - {column: callee_number, op: eq, param: phone_a}
+      - {column: started_at, op: between, params: [window_start, window_end]}
+    metric: call_count
+
+  plate_sightings:
+    description: >-
+      List ALPR camera reads of one licence plate within a time window, oldest first. Use to place
+      a vehicle at camera locations and times.
+    source: plate_reads
+    params:
+      plate: {type: plate, required: true, description: Licence plate.}
+      window_start: {type: timestamp, required: true, description: Window start (inclusive).}
+      window_end: {type: timestamp, required: true, description: Window end (inclusive).}
+    filters:
+      - {column: plate, op: eq, param: plate}
+      - {column: read_at, op: between, params: [window_start, window_end]}
+    select: [plate, plate_state, read_at, camera_id, location_name, latitude, longitude, confidence]
+    order_by:
+      - {column: read_at, direction: asc}
+
+  plate_sightings_near:
+    description: >-
+      List all ALPR camera reads at locations whose name contains the given text within a time
+      window, oldest first. Use to find which vehicles passed a place (e.g. "Riverside").
+    source: plate_reads
+    params:
+      location_name: {type: string, required: true, description: Location name fragment.}
+      window_start: {type: timestamp, required: true, description: Window start (inclusive).}
+      window_end: {type: timestamp, required: true, description: Window end (inclusive).}
+    filters:
+      - {column: location_name, op: ilike, param: location_name}
+      - {column: read_at, op: between, params: [window_start, window_end]}
+    select: [plate, plate_state, read_at, camera_id, location_name, latitude, longitude, confidence]
+    order_by:
+      - {column: read_at, direction: asc}
+
+  custody_chain:
+    description: >-
+      Return the chain-of-custody log entries for one physical evidence item, in collection
+      order. Use to check who collected and handled an item and when.
+    source: custody_records
+    params:
+      item_id: {type: string, required: true, description: "Physical item tag, e.g. ITEM-007."}
+    filters:
+      - {column: item_id, op: eq, param: item_id}
+    select: [item_id, description, collected_by, collected_at, collected_location, custody_chain]
+    order_by:
+      - {column: collected_at, direction: asc}
+      - {column: row_id, direction: asc}
