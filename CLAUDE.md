@@ -131,8 +131,10 @@ retrieval → agent-core → frontend. Evals gate everything from week 2 onward.
   `SYNTHETIC DATA` banner.
 
 **Git**
-- Branch per ticket. Use small commits with imperative subjects (`feat(api): ...`,
-  `fix(workers): ...`, `chore: ...`).
+- All work lands on `master` (tech lead's choice), pushed to `origin`
+  (`github.com/adityashah1603/CaseLens`). Short-lived worktree branches for parallel agents are
+  merged back into `master` sequentially.
+- Use small commits with imperative subjects (`feat(api): ...`, `fix(workers): ...`, `chore: ...`).
 
 ## Commands
 
