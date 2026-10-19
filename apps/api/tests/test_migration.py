@@ -1,4 +1,4 @@
-"""Tests for migrations 0001-0002 (schema, RLS, grants, hash-chained audit log, admin).
+"""Tests for migrations 0001-0003 (schema, RLS, grants, hash-chained audit log, admin).
 
 Needs a real Postgres 16 + pgvector. Skipped unless CASELENS_TEST_DATABASE_URL is set to a
 `postgresql+psycopg://` URL for a superuser on an EMPTY, throwaway database (the tests run
@@ -65,7 +65,7 @@ HELPER_FUNCTIONS = frozenset(
         "audit_log_verify",
     }
 )
-HEAD_REVISION = "0002"
+HEAD_REVISION = "0003"
 
 Conn = psycopg.Connection[TupleRow]
 
@@ -657,3 +657,38 @@ def test_agent_run_updatable_by_owner_only_while_running(conn: Conn) -> None:
     frozen = conn.execute("UPDATE agent_runs SET latency_ms = 1 WHERE id = %s", (run,))
     assert frozen.rowcount == 0
     assert _scalar(conn, "SELECT latency_ms FROM agent_runs WHERE id = %s", (run,)) == 4200
+
+
+# ------------------------------------------------------------------------------------------
+# 0003: worker-written system audit events (user_id NULL)
+# ------------------------------------------------------------------------------------------
+
+
+def test_worker_appends_system_audit_events(conn: Conn) -> None:
+    s = _seed(conn)
+    admin = _make_admin(conn)
+    _act_as(conn, "caselens_app", s.lead_a)
+    conn.execute(
+        "INSERT INTO audit_log (user_id, case_id, action) VALUES (%s, %s, 'evidence.upload')",
+        (s.lead_a, s.case_a),
+    )
+
+    _act_as(conn, "caselens_worker", None)
+    conn.execute(
+        "INSERT INTO audit_log (case_id, action, payload) VALUES (%s, %s, %s)",
+        (s.case_a, "ingest.stage_succeeded", '{"stage": "ocr", "synthetic": true}'),
+    )
+    _assert_denied(
+        conn,
+        "INSERT INTO audit_log (user_id, case_id, action) VALUES (%s, %s, 'spoofed')",
+        (s.lead_a, s.case_a),
+    )
+    _assert_denied(conn, "SELECT count(*) FROM audit_log")
+    _assert_denied(conn, "UPDATE audit_log SET action = 'tampered'")
+    _assert_denied(conn, "DELETE FROM audit_log")
+
+    _act_as(conn, "caselens_app", s.lead_a)
+    rows = conn.execute("SELECT user_id, action FROM audit_log ORDER BY id").fetchall()
+    assert rows == [(s.lead_a, "evidence.upload"), (None, "ingest.stage_succeeded")]
+    _act_as(conn, "caselens_app", admin)
+    assert conn.execute("SELECT * FROM public.audit_log_verify()").fetchone() == (True, 2, None)

@@ -2174,7 +2174,10 @@ components:
         `row_hash = sha256(prev_hash || user_id || case_id || action || payload_hash || ts)`;
         the first row's `prev_hash` is 64 zeros. Actions include `case.create`, `case.update`,
         `member.add`, `member.update`, `member.remove`, `evidence.upload`, `evidence.view`,
-        `agent.ask`, `agent.tool_call`, `timeline.view`, `entity_link.revert`, `audit.view`.
+        `agent.ask`, `agent.tool_call`, `timeline.view`, `entity_link.revert`, `audit.view`,
+        `admin.audit.view`, `admin.audit.verify`. A null `user_id` marks a system event written by an
+        ingest worker (`ingest.stage_succeeded`, `ingest.stage_failed`, `ingest.dead_lettered`,
+        `evidence.integrity_check`).
       properties:
         id:
           type: integer

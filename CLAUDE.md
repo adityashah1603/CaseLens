@@ -66,7 +66,7 @@ Prefer free / open-source tools and free tiers (see `reference/DECISIONS.md`).
 ### Contracts (frozen; change only with tech-lead approval)
 
 - API: `docs/contracts/openapi.yaml`
-- DB schema + RLS: `apps/api/alembic/versions/` (0001 initial, 0002 admin + run updates)
+- DB schema + RLS: `apps/api/alembic/versions/` (0001 initial, 0002 admin + run updates, 0003 worker system audit)
 - Agent tool schemas: `packages/agent/caselens_agent/schemas/tools/*.json`
 - Answer contract: `packages/agent/caselens_agent/schemas/answer.schema.json`
 - Semantic layer: `packages/semantic_layer/caselens_semantic_layer/semantic_layer.yaml`
