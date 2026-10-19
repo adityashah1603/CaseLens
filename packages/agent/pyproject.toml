@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caselens-agent"
+version = "0.0.1"
+description = "CaseLens investigator agent: tools, loop, answer validator, model router."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["caselens_agent*"]
+
+[tool.setuptools.package-data]
+"caselens_agent" = ["py.typed", "schemas/*.json", "schemas/tools/*.json"]

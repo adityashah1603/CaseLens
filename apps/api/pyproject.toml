@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caselens-api"
+version = "0.0.1"
+description = "CaseLens HTTP API (FastAPI)."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.146",
+  "uvicorn[standard]>=0.54",
+  "pydantic>=2.14",
+  "pydantic-settings>=2.16",
+  "sqlalchemy>=2.1",
+  "alembic>=1.20",
+  "psycopg[binary]>=3.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["caselens_api*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "py.typed"]

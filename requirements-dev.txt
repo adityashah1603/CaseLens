@@ -1,0 +1,20 @@
+# Local + CI dev install: editable monorepo packages plus pinned tooling.
+#   Windows: python -m venv .venv && .venv/Scripts/python -m pip install -r requirements-dev.txt
+#   Unix:    python -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
+-e ./apps/api
+-e ./workers
+-e ./packages/agent
+-e ./packages/retrieval
+-e ./packages/semantic_layer
+-e ./evals
+-e ./data_gen
+
+pytest==9.1.1
+httpx==0.28.1
+ruff==0.17.1
+mypy==2.4.0
+jsonschema==4.26.0
+referencing==0.37.0
+openapi-spec-validator==0.9.0
+types-PyYAML==6.0.12.20260906
+types-jsonschema==4.26.0.20261006

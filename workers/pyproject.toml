@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caselens-workers"
+version = "0.0.1"
+description = "CaseLens ingestion workers (per-modality pipelines)."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["caselens_workers*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "py.typed"]

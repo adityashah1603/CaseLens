@@ -1,0 +1,56 @@
+# Root tool configuration for the Python side of the monorepo.
+# Each Python package has its own pyproject.toml; this file only configures shared tools.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["apps/web", "infra"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["caselens_*"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"]
+"tests/**" = ["S101"]
+"**/alembic/versions/**" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+explicit_package_bases = true
+namespace_packages = true
+# Source packages are resolved through mypy_path; tests are type-checked by pytest runs, not mypy.
+mypy_path = "apps/api,workers,packages/agent,packages/retrieval,packages/semantic_layer,evals,data_gen"
+files = [
+  "apps/api/caselens_api",
+  "workers/caselens_workers",
+  "packages/agent/caselens_agent",
+  "packages/retrieval/caselens_retrieval",
+  "packages/semantic_layer/caselens_semantic_layer",
+  "evals/caselens_evals",
+  "data_gen/caselens_data_gen",
+]
+
+[[tool.mypy.overrides]]
+module = ["openapi_spec_validator.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib -q"
+testpaths = [
+  "apps/api/tests",
+  "workers/tests",
+  "packages/agent/tests",
+  "packages/retrieval/tests",
+  "packages/semantic_layer/tests",
+  "evals/tests",
+  "data_gen/tests",
+  "tests",
+]
+markers = [
+  "db: needs a running Postgres+pgvector (set CASELENS_TEST_DATABASE_URL)",
+]

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caselens-semantic-layer"
+version = "0.0.1"
+description = "CaseLens semantic layer: YAML definitions and SQL compiler."
+requires-python = ">=3.11"
+dependencies = [
+  "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["caselens_semantic_layer*"]
+
+[tool.setuptools.package-data]
+"caselens_semantic_layer" = ["py.typed", "*.json", "*.yaml"]
