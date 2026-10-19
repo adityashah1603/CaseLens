@@ -62,6 +62,10 @@ tags:
     description: Conflicting claims surfaced from evidence.
   - name: audit
     description: Append-only, hash-chained audit log.
+  - name: admin
+    description: >-
+      Platform administration. Requires `users.is_admin`, which only an operator can set
+      (never through this API).
 
 paths:
   /healthz:
@@ -867,6 +871,88 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationError'
 
+  /v1/admin/audit:
+    get:
+      tags: [admin]
+      operationId: listAllAuditEntries
+      summary: Read the audit log across all cases
+      description: |
+        Platform admin only (403 otherwise). Every audit entry in chain order (ascending `id`),
+        across all cases and including entries with no case. Reading it is itself audited
+        (`admin.audit.view`).
+      parameters:
+        - name: case_id
+          in: query
+          required: false
+          description: Only entries for this case.
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: query
+          required: false
+          description: Only entries with this action (for example `evidence.view`).
+          schema:
+            type: string
+            maxLength: 100
+        - name: user_id
+          in: query
+          required: false
+          description: Only entries by this user.
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          required: false
+          description: Only entries at or after this time.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Only entries at or before this time.
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntryList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /v1/admin/audit/verify:
+    get:
+      tags: [admin]
+      operationId: verifyAuditChain
+      summary: Verify the whole audit hash chain
+      description: |
+        Platform admin only (403 otherwise). Recomputes every `prev_hash` link, `payload_hash`
+        and `row_hash` inside the database (`audit_log_verify()`, migration 0002) with exactly
+        the formula from migration 0001. Audited (`admin.audit.verify`).
+      responses:
+        '200':
+          description: The verification result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditVerification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1112,10 +1198,13 @@ components:
           type: [string, 'null']
         is_demo:
           type: boolean
+        is_admin:
+          type: boolean
+          description: Platform admin (cross-case audit read and chain verification).
         created_at:
           type: string
           format: date-time
-      required: [id, email, display_name, is_demo, created_at]
+      required: [id, email, display_name, is_demo, is_admin, created_at]
     Membership:
       type: object
       properties:
@@ -2199,6 +2288,20 @@ components:
         next_cursor:
           $ref: '#/components/schemas/NextCursor'
       required: [items, next_cursor]
+    AuditVerification:
+      type: object
+      properties:
+        valid:
+          type: boolean
+          description: True when every row's hashes and prev_hash link recompute correctly.
+        checked_rows:
+          type: integer
+          minimum: 0
+          description: Rows checked; on failure, this includes the first invalid row.
+        first_invalid_id:
+          type: [integer, 'null']
+          description: id of the first row that fails verification; null when valid.
+      required: [valid, checked_rows, first_invalid_id]
     AuditEntryList:
       type: object
       properties:

@@ -1,4 +1,4 @@
-"""Tests for migration 0001 (schema, RLS, grants, hash-chained audit log).
+"""Tests for migrations 0001-0002 (schema, RLS, grants, hash-chained audit log, admin).
 
 Needs a real Postgres 16 + pgvector. Skipped unless CASELENS_TEST_DATABASE_URL is set to a
 `postgresql+psycopg://` URL for a superuser on an EMPTY, throwaway database (the tests run
@@ -61,8 +61,11 @@ HELPER_FUNCTIONS = frozenset(
         "app_can_bootstrap_case",
         "audit_log_chain",
         "audit_log_block_mutation",
+        "app_is_admin",
+        "audit_log_verify",
     }
 )
+HEAD_REVISION = "0002"
 
 Conn = psycopg.Connection[TupleRow]
 
@@ -225,7 +228,7 @@ def test_upgrade_creates_tables_and_downgrade_roundtrip(migrated: str) -> None:
     cfg = _alembic_config(migrated)
     with psycopg.connect(_libpq_url(migrated), autocommit=True) as c:
         assert _public_tables(c) >= EXPECTED_TABLES
-        assert _scalar(c, "SELECT version_num FROM alembic_version") == "0001"
+        assert _scalar(c, "SELECT version_num FROM alembic_version") == HEAD_REVISION
 
         command.downgrade(cfg, "base")
         assert not (EXPECTED_TABLES & _public_tables(c))
@@ -558,3 +561,99 @@ def test_audit_log_readable_only_by_case_lead(conn: Conn) -> None:
         assert _scalar(conn, "SELECT count(*) FROM audit_log") == 0
     _act_as(conn, "caselens_readonly", s.lead_a)
     _assert_denied(conn, "SELECT count(*) FROM audit_log")
+
+
+# ------------------------------------------------------------------------------------------
+# 0002: platform admin + in-flight agent run updates
+# ------------------------------------------------------------------------------------------
+
+
+def _make_admin(conn: Conn) -> uuid.UUID:
+    _act_as(conn, None, None)
+    admin = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO users (id, oidc_subject, email, display_name, is_admin)"
+        " VALUES (%s, 'synthetic|admin', 'admin@example.test', 'SYNTHETIC admin', true)",
+        (admin,),
+    )
+    return admin
+
+
+def _write_audit_rows(conn: Conn, s: Seed) -> None:
+    for user, case in ((s.lead_a, s.case_a), (s.lead_b, s.case_b), (s.lead_a, None)):
+        _act_as(conn, "caselens_app", user)
+        conn.execute(
+            "INSERT INTO audit_log (user_id, case_id, action, payload) VALUES (%s, %s, %s, %s)",
+            (user, case, "case.view", '{"synthetic": true}'),
+        )
+
+
+def test_admin_reads_audit_across_cases(conn: Conn) -> None:
+    s = _seed(conn)
+    admin = _make_admin(conn)
+    _write_audit_rows(conn, s)
+
+    _act_as(conn, "caselens_app", admin)
+    assert _scalar(conn, "SELECT count(*) FROM audit_log") == 3
+    _act_as(conn, "caselens_app", s.lead_a)
+    assert _scalar(conn, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_app_cannot_grant_admin(conn: Conn) -> None:
+    s = _seed(conn)
+    _act_as(conn, "caselens_app", s.lead_a)
+    _assert_denied(conn, "UPDATE users SET is_admin = true WHERE id = %s", (s.lead_a,))
+    _assert_denied(
+        conn,
+        "INSERT INTO users (id, oidc_subject, is_admin) VALUES (%s, 'synthetic|x', true)",
+        (uuid.uuid4(),),
+    )
+    assert _scalar(conn, "SELECT public.app_is_admin()") is False
+
+
+def test_audit_verify_is_admin_only_and_detects_tampering(conn: Conn) -> None:
+    s = _seed(conn)
+    admin = _make_admin(conn)
+    _write_audit_rows(conn, s)
+
+    _act_as(conn, "caselens_app", s.lead_a)
+    _assert_denied(conn, "SELECT * FROM public.audit_log_verify()")
+
+    _act_as(conn, "caselens_app", admin)
+    assert conn.execute("SELECT * FROM public.audit_log_verify()").fetchone() == (True, 3, None)
+
+    # Simulate an attacker with superuser rights who disables the append-only trigger.
+    _act_as(conn, None, None)
+    conn.execute("ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update_delete")
+    second = _scalar(conn, "SELECT id FROM audit_log ORDER BY id OFFSET 1 LIMIT 1")
+    conn.execute("UPDATE audit_log SET payload = '{\"synthetic\": false}' WHERE id = %s", (second,))
+    _act_as(conn, "caselens_app", admin)
+    assert conn.execute("SELECT * FROM public.audit_log_verify()").fetchone() == (
+        False,
+        2,
+        second,
+    )
+
+
+def test_agent_run_updatable_by_owner_only_while_running(conn: Conn) -> None:
+    s = _seed(conn)
+    run = uuid.uuid4()
+    _act_as(conn, "caselens_app", s.viewer_a)
+    conn.execute(
+        "INSERT INTO agent_runs (id, case_id, user_id, question) VALUES (%s, %s, %s, %s)",
+        (run, s.case_a, s.viewer_a, "SYNTHETIC: who was in the gray sedan?"),
+    )
+
+    _act_as(conn, "caselens_app", s.lead_a)
+    other = conn.execute("UPDATE agent_runs SET latency_ms = 1 WHERE id = %s", (run,))
+    assert other.rowcount == 0
+
+    _act_as(conn, "caselens_app", s.viewer_a)
+    _assert_denied(conn, "UPDATE agent_runs SET question = 'rewritten' WHERE id = %s", (run,))
+    done = conn.execute(
+        "UPDATE agent_runs SET status = 'succeeded', latency_ms = 4200 WHERE id = %s", (run,)
+    )
+    assert done.rowcount == 1
+    frozen = conn.execute("UPDATE agent_runs SET latency_ms = 1 WHERE id = %s", (run,))
+    assert frozen.rowcount == 0
+    assert _scalar(conn, "SELECT latency_ms FROM agent_runs WHERE id = %s", (run,)) == 4200

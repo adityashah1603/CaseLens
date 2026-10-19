@@ -270,3 +270,22 @@ def test_evidence_has_recorded_at_and_ingest_jobs(spec: dict[str, Any]) -> None:
 def test_case_has_demo_fields(spec: dict[str, Any]) -> None:
     props = spec["components"]["schemas"]["Case"]["properties"]
     assert {"suggested_questions", "evidence_count", "last_activity_at"} <= set(props)
+
+
+def test_admin_audit_endpoints(spec: dict[str, Any]) -> None:
+    paths = spec["paths"]
+    for path, op_id in (
+        ("/v1/admin/audit", "listAllAuditEntries"),
+        ("/v1/admin/audit/verify", "verifyAuditChain"),
+    ):
+        op = paths[path]["get"]
+        assert op["operationId"] == op_id
+        assert op["tags"] == ["admin"]
+        assert "403" in op["responses"]
+    schemas = spec["components"]["schemas"]
+    assert set(schemas["AuditVerification"]["required"]) == {
+        "valid",
+        "checked_rows",
+        "first_invalid_id",
+    }
+    assert "is_admin" in schemas["User"]["required"]
