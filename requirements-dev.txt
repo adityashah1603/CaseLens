@@ -7,7 +7,7 @@
 -e ./packages/retrieval
 -e ./packages/semantic_layer
 -e ./evals
--e ./data_gen
+-e ./data_gen[audio,video]
 
 pytest==9.1.1
 httpx==0.28.1
