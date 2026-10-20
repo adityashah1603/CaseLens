@@ -7,7 +7,10 @@ CaseLens is an evidence-search copilot. Upload a mixed case file (PDFs, audio, v
 in plain English. Answers come back as a cited, auditable timeline: every claim links to its source page,
 timestamp, frame, or row, and the system says "insufficient evidence" instead of guessing.
 
-**Status:** Week 1, Foundations. Contracts and scaffold only; there are no features yet.
+**Status:** Week 2 of 6, Ingestion (gate passed). The demo case ingests end to end: PDFs (incl. a scanned
+statement via OCR), 911 call and interview audio (transcribed and split by speaker), CCTV video (tracked
+vehicles and people), and CSV call / plate-reader records, with entities, events and an audit log. There is
+no web UI or question answering yet (Weeks 3-4).
 
 ## Repo layout
 
@@ -35,6 +38,27 @@ make migrate   # apply the schema
 make test      # all tests
 make lint      # ruff, mypy, eslint, tsc
 make eval      # eval harness (stub)
+```
+
+## See it working (ingest the demo case)
+
+After `make install`, `make up` and `make migrate`, copy `.env.example` to `.env` and optionally add a free
+Gemini key (`CASELENS_GEMINI_API_KEY`) for name / event extraction and video captions. Then:
+
+```
+python -m caselens_data_gen --case riverside_lot          # generate the SYNTHETIC case (~1 min)
+python -m caselens_workers submit data_gen/output/riverside_lot --name "The Riverside Lot Homicide"
+python -m caselens_workers run --once                     # ingest all 18 files (~10 min on a laptop CPU)
+python -m caselens_workers status                         # per-stage job status
+python -m caselens_evals.ingest_check                     # compare with the hidden answer key -> GATE: PASS
+```
+
+To look at the results, query Postgres (`docker compose exec postgres psql -U caselens -d caselens`), e.g.
+the cross-source timeline around the shooting:
+
+```sql
+SELECT to_char(t_start AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS') AS t, description
+FROM events WHERE t_start BETWEEN '2026-03-14 22:38-07' AND '2026-03-14 22:50-07' ORDER BY t_start;
 ```
 
 Contributor and agent rules are in `CLAUDE.md`.
