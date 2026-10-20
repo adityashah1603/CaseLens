@@ -15,6 +15,7 @@ dependencies = [
   "minio>=7.2",
   "numpy>=2.0",
   "fastembed>=0.7",
+  "caselens-agent",  # model router (extract, VLM fallback, captions)
 ]
 
 [project.optional-dependencies]

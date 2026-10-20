@@ -65,12 +65,18 @@ class ChunkIn(BaseModel):
 
 
 def replace_chunks(ctx: StageContext, chunks: Sequence[ChunkIn]) -> int:
-    """Idempotently replace this evidence's chunks (and the mentions that pointed at them)."""
+    """Idempotently replace this evidence's chunks (and the mentions and events citing them)."""
     ev = ctx.evidence
     with ctx.conn.transaction():
         ctx.conn.execute(
             "DELETE FROM public.mentions WHERE chunk_id IN "
             "(SELECT id FROM public.chunks WHERE evidence_id = %s)",
+            (ev.id,),
+        )
+        # Events cite chunk ids (uuid[], no FK): drop the ones citing chunks about to vanish.
+        ctx.conn.execute(
+            "DELETE FROM public.events WHERE source_chunk_ids && "
+            "ARRAY(SELECT id FROM public.chunks WHERE evidence_id = %s)",
             (ev.id,),
         )
         ctx.conn.execute("DELETE FROM public.chunks WHERE evidence_id = %s", (ev.id,))

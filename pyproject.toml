@@ -36,7 +36,7 @@ files = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["openapi_spec_validator.*"]
+module = ["openapi_spec_validator.*", "rapidocr_onnxruntime.*", "soundfile.*", "faster_whisper.*", "speechbrain.*", "sklearn.*", "scenedetect.*", "ultralytics.*", "fastembed.*", "minio.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
