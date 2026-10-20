@@ -7,7 +7,7 @@ name = "caselens-agent"
 version = "0.0.1"
 description = "CaseLens investigator agent: tools, loop, answer validator, model router."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pydantic>=2.11", "pydantic-settings>=2.10", "httpx>=0.28"]
 
 [tool.setuptools.packages.find]
 include = ["caselens_agent*"]
