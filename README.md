@@ -7,10 +7,12 @@ CaseLens is an evidence-search copilot. Upload a mixed case file (PDFs, audio, v
 in plain English. Answers come back as a cited, auditable timeline: every claim links to its source page,
 timestamp, frame, or row, and the system says "insufficient evidence" instead of guessing.
 
-**Status:** Week 3 of 6, Retrieval + agent (gate passed: first cited answer). The demo case ingests end to
+**Status:** Week 4 of 6, Frontend (full flow runs locally in the browser; Week 3 gate passed). The demo case ingests end to
 end, all four modalities, and the investigator agent answers in plain English with citations (page + bbox,
 audio ms, video frame, table row), shows contradictions side by side, and refuses with "insufficient
-evidence" when nothing supports an answer. There is no web UI yet (Week 4).
+evidence" when nothing supports an answer. The web app (local dev sign-in for now; Firebase in Week 6)
+shows cited answers, opens each citation at the exact page / second / frame / row, and has the timeline,
+entity graph, ingest progress and audit views.
 
 ## Repo layout
 
@@ -66,5 +68,18 @@ Then ask the investigator agent (needs `CASELENS_GEMINI_API_KEY`; ids from the `
 ```
 python -m caselens_agent ask --case-id <case uuid> --user-id <seed lead uuid> "Who was in the gray sedan on March 14?"
 ```
+
+## Run the web app (local)
+
+```
+# .env needs CASELENS_DEV_AUTH_SECRET (any 32+ char random string) and CASELENS_ENVIRONMENT=local
+python -m caselens_api seed-dev-users     # adds analyst + demo viewer, prints dev tokens
+#   put them in apps/web/.env.local as VITE_DEV_TOKEN_LEAD / _ANALYST / _VIEWER (gitignored)
+python -m caselens_api serve              # API on http://127.0.0.1:8000
+cd apps/web && pnpm dev                   # web app on http://127.0.0.1:5173
+```
+
+Pick a dev identity on the sign-in screen (lead, analyst, or the read-only demo viewer), open the demo case,
+and ask a question.
 
 Contributor and agent rules are in `CLAUDE.md`.
