@@ -75,7 +75,7 @@ def test_gemini_request_shape_and_rate_limit_retry() -> None:
     assert out.name == "SYNTHETIC Kemper"
     assert len(calls) == 2 and sleeps
     req = calls[-1]
-    assert req.url.path.endswith("/gemini-2.5-flash-lite:generateContent")
+    assert req.url.path.endswith("/gemini-3.5-flash-lite:generateContent")
     assert req.headers["x-goog-api-key"] == "test-key-SYNTHETIC"
     body = json.loads(req.content)
     assert body["generationConfig"]["responseJsonSchema"] == Out.model_json_schema()

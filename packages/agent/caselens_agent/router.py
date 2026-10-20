@@ -29,11 +29,11 @@ T = TypeVar("T", bound=BaseModel)
 # Cheap fast model for extraction / captions / adjudication; stronger one for plan + synthesis.
 DEFAULT_MODELS: dict[Provider, dict[Task, str]] = {
     "gemini": {
-        "extract": "gemini-2.5-flash-lite",
-        "caption": "gemini-2.5-flash-lite",
-        "adjudicate": "gemini-2.5-flash-lite",
-        "plan": "gemini-2.5-flash",
-        "synthesize": "gemini-2.5-flash",
+        "extract": "gemini-3.5-flash-lite",
+        "caption": "gemini-3.5-flash-lite",
+        "adjudicate": "gemini-3.5-flash-lite",
+        "plan": "gemini-3.5-flash",
+        "synthesize": "gemini-3.5-flash",
     },
     "ollama": dict.fromkeys(
         ("extract", "caption", "adjudicate", "plan", "synthesize"), "gemma3:4b"
@@ -199,9 +199,15 @@ class ModelRouter:
             {"x-goog-api-key": key.get_secret_value()},
         )
         try:
-            text: str = data["candidates"][0]["content"]["parts"][0]["text"]
+            parts_out = data["candidates"][0]["content"]["parts"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ModelError("gemini returned no content") from exc
+        # Thinking models may add thought parts; keep only the answer text.
+        text = "".join(
+            p["text"] for p in parts_out if isinstance(p.get("text"), str) and not p.get("thought")
+        )
+        if not text:
+            raise ModelError("gemini returned no content")
         return text
 
     def _ollama(
