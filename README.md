@@ -7,10 +7,10 @@ CaseLens is an evidence-search copilot. Upload a mixed case file (PDFs, audio, v
 in plain English. Answers come back as a cited, auditable timeline: every claim links to its source page,
 timestamp, frame, or row, and the system says "insufficient evidence" instead of guessing.
 
-**Status:** Week 2 of 6, Ingestion (gate passed). The demo case ingests end to end: PDFs (incl. a scanned
-statement via OCR), 911 call and interview audio (transcribed and split by speaker), CCTV video (tracked
-vehicles and people), and CSV call / plate-reader records, with entities, events and an audit log. There is
-no web UI or question answering yet (Weeks 3-4).
+**Status:** Week 3 of 6, Retrieval + agent (gate passed: first cited answer). The demo case ingests end to
+end, all four modalities, and the investigator agent answers in plain English with citations (page + bbox,
+audio ms, video frame, table row), shows contradictions side by side, and refuses with "insufficient
+evidence" when nothing supports an answer. There is no web UI yet (Week 4).
 
 ## Repo layout
 
@@ -59,6 +59,12 @@ the cross-source timeline around the shooting:
 ```sql
 SELECT to_char(t_start AT TIME ZONE 'America/Los_Angeles', 'HH24:MI:SS') AS t, description
 FROM events WHERE t_start BETWEEN '2026-03-14 22:38-07' AND '2026-03-14 22:50-07' ORDER BY t_start;
+```
+
+Then ask the investigator agent (needs `CASELENS_GEMINI_API_KEY`; ids from the `cases` and `users` tables):
+
+```
+python -m caselens_agent ask --case-id <case uuid> --user-id <seed lead uuid> "Who was in the gray sedan on March 14?"
 ```
 
 Contributor and agent rules are in `CLAUDE.md`.
