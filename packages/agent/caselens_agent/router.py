@@ -22,7 +22,7 @@ import httpx
 from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-Task = Literal["extract", "caption", "adjudicate", "plan", "synthesize"]
+Task = Literal["extract", "caption", "adjudicate", "plan", "synthesize", "judge"]
 Provider = Literal["gemini", "ollama", "fake"]
 T = TypeVar("T", bound=BaseModel)
 
@@ -34,11 +34,14 @@ DEFAULT_MODELS: dict[Provider, dict[Task, str]] = {
         "adjudicate": "gemini-3.5-flash-lite",
         "plan": "gemini-3.5-flash",
         "synthesize": "gemini-3.5-flash",
+        "judge": "gemini-3.5-flash-lite",
     },
     "ollama": dict.fromkeys(
-        ("extract", "caption", "adjudicate", "plan", "synthesize"), "gemma3:4b"
+        ("extract", "caption", "adjudicate", "plan", "synthesize", "judge"), "gemma3:4b"
     ),
-    "fake": dict.fromkeys(("extract", "caption", "adjudicate", "plan", "synthesize"), "fake"),
+    "fake": dict.fromkeys(
+        ("extract", "caption", "adjudicate", "plan", "synthesize", "judge"), "fake"
+    ),
 }
 
 # Free-tier quotas are per model and small (a busy day can exhaust one), so each task has a
@@ -49,6 +52,8 @@ GEMINI_FALLBACKS: dict[Task, tuple[str, ...]] = {
     "adjudicate": ("gemini-3.1-flash-lite", "gemini-3-flash-preview"),
     "plan": ("gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
     "synthesize": ("gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
+    # Eval judge (Week 5): cheap model, separate quota from the agent where possible.
+    "judge": ("gemini-3.1-flash-lite", "gemini-3-flash-preview"),
 }
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -66,6 +71,7 @@ class RouterSettings(BaseSettings):
     model_adjudicate: str | None = None
     model_plan: str | None = None
     model_synthesize: str | None = None
+    model_judge: str | None = None
     llm_threads: int = 4  # ollama CPU threads, kept low so the machine stays responsive
     llm_timeout_s: float = 120.0
     llm_context_tokens: int = 8192
