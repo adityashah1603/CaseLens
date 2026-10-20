@@ -7,7 +7,12 @@ name = "caselens-retrieval"
 version = "0.0.1"
 description = "CaseLens hybrid retrieval (pgvector + full-text, RRF, rerank)."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "pydantic>=2.11",
+  "pydantic-settings>=2.10",
+  "psycopg[binary]>=3.2",
+  "fastembed>=0.7",
+]
 
 [tool.setuptools.packages.find]
 include = ["caselens_retrieval*"]
