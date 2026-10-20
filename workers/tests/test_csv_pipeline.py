@@ -121,9 +121,9 @@ def test_call_records_load_register_and_rerun_idempotent(
         return tuple(row)
 
     assert counts() == (2, 2, 4, 2)
-    for stage in ("load", "register"):
+    for stage in ("load", "register"):  # one at a time: claim order within a txn is by id
         assert jobs.requeue(owner_conn, ev.evidence_id, stage)
-    assert _drain(owner_conn, ev, worker_settings) == ["load:succeeded", "register:succeeded"]
+        assert _drain(owner_conn, ev, worker_settings) == [f"{stage}:succeeded"]
     assert counts() == (2, 2, 4, 2)
 
 
