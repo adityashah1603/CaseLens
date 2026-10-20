@@ -1,5 +1,7 @@
-"""Shared fixtures. DB tests run against CASELENS_TEST_DATABASE_URL, migrated to head, each inside
-a transaction that is rolled back, with SYNTHETIC rows only."""
+"""Shared pytest fixtures for every package.
+
+DB tests run against CASELENS_TEST_DATABASE_URL, migrated to head, each inside a transaction that
+is rolled back, with SYNTHETIC rows only."""
 
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from caselens_workers.settings import WorkerSettings, libpq_url
 from caselens_workers.storage import MemoryObjectStore, evidence_key
 from caselens_workers.testing import SeededEvidence, as_role
 
-API_DIR = Path(__file__).resolve().parents[2] / "apps" / "api"
+API_DIR = Path(__file__).resolve().parent / "apps" / "api"
 
 
 @pytest.fixture(scope="session")
