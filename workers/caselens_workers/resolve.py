@@ -186,9 +186,20 @@ def _vehicle_conflict(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return False
 
 
+_DIGITS = re.compile(r"\d+")
+
+
 def name_score(entity_type: EntityType, a: str, b: str, trigram: float = 0.0) -> float:
-    """Combined similarity in 0..1 of two normalized names (rapidfuzz + pg_trgm)."""
+    """Combined similarity in 0..1 of two normalized names (rapidfuzz + pg_trgm).
+
+    Names that both carry numbers but different ones ("interview room 1" / "room 2",
+    "unit 14" / "unit 41") score 0: they name different things however similar the words are.
+    """
     from rapidfuzz import fuzz
+
+    da, db = set(_DIGITS.findall(a)), set(_DIGITS.findall(b))
+    if da and db and da != db:
+        return 0.0
 
     score = max(fuzz.token_set_ratio(a, b) / 100.0, trigram)
     if entity_type == "person" and _person_compatible(a, b):

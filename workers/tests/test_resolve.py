@@ -294,3 +294,15 @@ def test_vehicle_attribute_conflict_blocks_link(owner_conn: Conn, case_id: uuid.
     stats = link_similar_entities(owner_conn, case_id, [gray, blue, plain])
     # blue vs gray conflict; "the Civic" matches both roots strongly -> ambiguous, no adjudicator.
     assert stats.fuzzy == 0 and stats.adjudication_skipped == 1
+
+
+def test_names_with_different_numbers_never_match() -> None:
+    from caselens_workers.resolve import name_score
+
+    assert (
+        name_score(
+            "location", "pcpd headquarters interview room 1", "pcpd headquarters interview room 2"
+        )
+        == 0.0
+    )
+    assert name_score("location", "unit 14", "larkspur court apartments unit 14") > 0.9
