@@ -8,7 +8,12 @@ version = "0.0.1"
 description = "CaseLens semantic layer: YAML definitions and SQL compiler."
 requires-python = ">=3.11"
 dependencies = [
+  "caselens-agent",
+  "jsonschema>=4.23",
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.11",
   "pyyaml>=6.0",
+  "rfc3339-validator>=0.1.4",
 ]
 
 [tool.setuptools.packages.find]
