@@ -15,6 +15,14 @@ dependencies = [
   "sqlalchemy>=2.1",
   "alembic>=1.20",
   "psycopg[binary]>=3.3",
+  "psycopg-pool>=3.2",
+  "pyjwt[crypto]>=2.10",
+  "python-multipart>=0.0.20",
+  "minio>=7.2",
+  "caselens-workers",  # storage keys, pipeline first stages
+  "caselens-agent",  # investigator agent runner (/ask)
+  "caselens-retrieval",  # agent search backends
+  "caselens-semantic-layer",  # agent query_records backend
 ]
 
 [tool.setuptools.packages.find]
