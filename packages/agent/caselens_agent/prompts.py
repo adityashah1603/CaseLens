@@ -18,13 +18,30 @@ from caselens_agent.contracts import load_tool_definitions
 # ---- model output shapes ------------------------------------------------------------------
 
 
+MAX_CALLS_PER_STEP = 4
+
+
+class PlannedCall(BaseModel):
+    tool: str
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentAction(BaseModel):
-    """One planning step: call a tool, or finish and write the answer."""
+    """One planning step: call one or more independent tools, or finish and write the answer."""
 
     thought: str = ""
     action: Literal["call_tool", "finish"]
     tool: str | None = None
     input: dict[str, Any] | None = None
+    # Independent calls to run in this same step (saves model round trips).
+    calls: list[PlannedCall] | None = Field(default=None, max_length=MAX_CALLS_PER_STEP)
+
+    def planned_calls(self) -> list[PlannedCall]:
+        if self.calls:
+            return list(self.calls)
+        if self.tool:
+            return [PlannedCall(tool=self.tool, input=self.input or {})]
+        return []
 
 
 class DraftCitation(BaseModel):
@@ -108,11 +125,15 @@ PLAN_SYSTEM = (
     + """
 How to work: plan, act, observe, reflect. Each turn reply with ONE JSON object:
   {"thought": "<short reasoning: what the last observation showed, what is still missing>",
-   "action": "call_tool", "tool": "<tool name>", "input": {<arguments matching input_schema>}}
+   "action": "call_tool",
+   "calls": [{"tool": "<tool name>", "input": {<arguments matching input_schema>}}, ...]}
 or, when you have enough sources to answer (or nothing more can help):
   {"thought": "<why you are done>", "action": "finish"}
 
-- You may call at most {max_calls} tools in total. Prefer precise calls; do not repeat a call.
+- Put up to 4 INDEPENDENT calls in one turn (e.g. get_entity + search_evidence + search_video +
+  query_records for different angles of the question); each call counts toward the total.
+- You may call at most {max_calls} tools in total. Prefer precise calls. Repeating an identical
+  call returns nothing new. Finish as soon as the sources answer the question.
 - Sources in observations carry short handles ("ref": "S1", "S2", ...). You cite handles only;
   never write ids or locators yourself.
 - Resolve names, plates and phone numbers with get_entity before querying records. Use

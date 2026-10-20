@@ -64,7 +64,10 @@ def _audit(conn: Conn, user_id: uuid.UUID, case_id: uuid.UUID, action: str, payl
 
 
 def model_label(router: ModelRouter) -> str:
-    plan, synth = router.model_for("plan"), router.model_for("synthesize")
+    # The models that actually answered (after any quota fallback), else the configured ones.
+    used = router.last_model
+    plan = used.get("plan") or router.model_for("plan")
+    synth = used.get("synthesize") or router.model_for("synthesize")
     models = plan if plan == synth else f"{plan}+{synth}"
     return f"{router.settings.llm_provider}:{models}"
 
@@ -163,6 +166,7 @@ def ask(
         "validation_errors": result.validation_errors,
         "fell_back": result.fell_back,
     }
+    model = model_label(router)
     with app_conn.transaction():
         app_conn.execute(
             "UPDATE public.agent_runs SET status = %s, model = %s, plan = %s, tool_calls = %s, "

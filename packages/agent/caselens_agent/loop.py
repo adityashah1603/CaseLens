@@ -10,6 +10,7 @@ answer falls back to `insufficient_evidence`.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,7 @@ from caselens_agent.prompts import (
     AgentAction,
     DraftAnswer,
     DraftCitation,
+    PlannedCall,
     plan_system,
     synth_system,
 )
@@ -30,6 +32,10 @@ from caselens_agent.validator import insufficient_evidence, validate_answer
 @dataclass(frozen=True)
 class AgentConfig:
     max_tool_calls: int = 8
+    # Wall-clock times in the evidence are local to the case (env CASELENS_CASE_TIMEZONE).
+    case_timezone: str = field(
+        default_factory=lambda: os.environ.get("CASELENS_CASE_TIMEZONE") or "America/Los_Angeles"
+    )
     # Rough budget for the model-facing transcript (~4 chars per token, ~40k input tokens).
     max_transcript_chars: int = 120_000
     max_observation_chars: int = 8_000
@@ -78,8 +84,12 @@ class LoopResult:
     stop_reason: str = "finish"
 
 
-def _render_step(step: int, action: AgentAction, outcome: ToolOutcome, limit: int) -> str:
-    call = json.dumps({"tool": action.tool, "input": action.input}, ensure_ascii=False)
+def _call_key(tool: str, tool_input: Any) -> str:
+    return json.dumps({"tool": tool, "input": tool_input}, ensure_ascii=False, sort_keys=True)
+
+
+def _render_step(step: int, call_obj: PlannedCall, outcome: ToolOutcome, limit: int) -> str:
+    call = json.dumps({"tool": call_obj.tool, "input": call_obj.input}, ensure_ascii=False)
     head = f"Step {step}: you called {call}"
     if not outcome.ok:
         return f"{head}\nTool error: {outcome.error}"
@@ -186,7 +196,13 @@ class AgentLoop:
     def _transcript(self, question: str, steps: list[str]) -> str:
         # The question may not open or close evidence blocks.
         safe = question.replace("<<<", "< < <").replace(">>>", "> > >")
-        parts = [f"Question from the investigator:\n{safe}"]
+        tz = self.config.case_timezone
+        parts = [
+            f"Question from the investigator:\n{safe}",
+            f"Case timezone: {tz}. Dates and times in the question and the evidence are local to "
+            f"it; write tool time filters with that local UTC offset (e.g. a whole local day "
+            f"2026-03-14T00:00:00-07:00 to 2026-03-15T00:00:00-07:00), never a bare Z day.",
+        ]
         if steps:
             parts.append("Tool calls so far:")
             parts.extend(steps)
@@ -202,6 +218,8 @@ class AgentLoop:
         thoughts: list[str] = []
         stop_reason = "max_tool_calls"
         system = plan_system(cfg.max_tool_calls)
+        seen: dict[str, int] = {}
+        repeats = 0
 
         while len(records) < cfg.max_tool_calls:
             transcript = self._transcript(question, steps)
@@ -216,29 +234,49 @@ class AgentLoop:
                 stop_reason = "model_error"
                 break
             thoughts.append(action.thought)
-            if action.action == "finish":
+            planned = action.planned_calls()
+            if action.action == "finish" or not planned:
                 stop_reason = "finish"
                 break
-            step = len(records) + 1
-            tool = action.tool or ""
-            outcome = self.runtime.call(tool, action.input if action.input is not None else {})
-            output = outcome.output or {}
-            record = ToolCallRecord(
-                step=step,
-                tool=tool,
-                input=action.input,
-                ok=outcome.ok,
-                error=outcome.error,
-                result_count=outcome.result_count,
-                sources=outcome.handles,
-                duration_ms=outcome.duration_ms,
-                sql=output.get("sql") if tool == "query_records" else None,
-                conflict_id=output.get("conflict_id") if tool == "flag_conflict" else None,
-            )
-            records.append(record)
-            steps.append(_render_step(step, action, outcome, cfg.max_observation_chars))
-            if self.on_tool_call is not None:
-                self.on_tool_call(record)
+            fresh = False
+            for call_obj in planned:
+                if len(records) >= cfg.max_tool_calls:
+                    break
+                key = _call_key(call_obj.tool, call_obj.input)
+                if key in seen:
+                    steps.append(
+                        f"Repeated call {key} skipped: it already ran as step {seen[key]}; "
+                        "use that result."
+                    )
+                    continue
+                fresh = True
+                step = len(records) + 1
+                seen[key] = step
+                outcome = self.runtime.call(call_obj.tool, call_obj.input)
+                output = outcome.output or {}
+                record = ToolCallRecord(
+                    step=step,
+                    tool=call_obj.tool,
+                    input=call_obj.input,
+                    ok=outcome.ok,
+                    error=outcome.error,
+                    result_count=outcome.result_count,
+                    sources=outcome.handles,
+                    duration_ms=outcome.duration_ms,
+                    sql=output.get("sql") if call_obj.tool == "query_records" else None,
+                    conflict_id=output.get("conflict_id")
+                    if call_obj.tool == "flag_conflict"
+                    else None,
+                )
+                records.append(record)
+                steps.append(_render_step(step, call_obj, outcome, cfg.max_observation_chars))
+                if self.on_tool_call is not None:
+                    self.on_tool_call(record)
+            if not fresh:
+                repeats += 1
+                if repeats >= 2:  # the model keeps repeating itself: stop and answer
+                    stop_reason = "repeated_calls"
+                    break
 
         answer, errors_log, fell_back, model_failed = self._synthesize(question, steps, ledger)
         return LoopResult(

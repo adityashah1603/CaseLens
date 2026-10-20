@@ -73,9 +73,13 @@ def test_gemini_request_shape_and_rate_limit_retry() -> None:
     )
     out = router.complete_json("extract", "sys", "user", Out, images=[b"\xff\xd8jpeg"])
     assert out.name == "SYNTHETIC Kemper"
-    assert len(calls) == 2 and sleeps
+    assert len(calls) == 2
+    # 429 on the primary model -> straight to the task's first fallback, no waiting.
+    assert calls[0].url.path.endswith("/gemini-3.5-flash-lite:generateContent")
     req = calls[-1]
-    assert req.url.path.endswith("/gemini-3.5-flash-lite:generateContent")
+    assert req.url.path.endswith("/gemini-3.1-flash-lite:generateContent")
+    assert router.last_model["extract"] == "gemini-3.1-flash-lite"
+    assert not sleeps
     assert req.headers["x-goog-api-key"] == "test-key-SYNTHETIC"
     body = json.loads(req.content)
     assert body["generationConfig"]["responseJsonSchema"] == Out.model_json_schema()
@@ -96,3 +100,33 @@ def test_http_errors_never_echo_the_key() -> None:
     with pytest.raises(ModelError) as exc:
         router.complete_json("extract", "sys", "user", Out)
     assert "secret" not in str(exc.value)
+
+
+def test_exhausted_model_is_skipped_and_overload_falls_through() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = request.url.path.split("/")[-1].split(":")[0]
+        seen.append(model)
+        if model == "gemini-3.5-flash":
+            return httpx.Response(429)
+        if model == "gemini-3-flash-preview":
+            return httpx.Response(503)
+        text = '{"name": "SYNTHETIC", "confidence": 1}'
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+
+    router = ModelRouter(
+        RouterSettings(llm_provider="gemini", gemini_api_key="k-SYNTHETIC", llm_overload_retries=0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda s: None,
+    )
+    router.complete_json("plan", "sys", "user", Out)
+    router.complete_json("plan", "sys", "user", Out)
+    # The second call skips the exhausted model but retries the merely overloaded one.
+    assert seen == [
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+    ]

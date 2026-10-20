@@ -404,3 +404,34 @@ def test_fake_backend_outputs_match_contract() -> None:
     bad = copy.deepcopy(records)
     bad["sources"][0]["row_id"] = 0
     assert output_errors("query_records", bad)
+
+
+def test_one_step_can_batch_independent_calls_and_repeats_are_skipped() -> None:
+    fakes = FakeBackends(
+        evidence=[evidence_result(WITNESS, page=2)],
+        records=plate_records("SYN4821", [("2026-03-14T22:40:58-07:00", "Riverside Lot", 118)]),
+    )
+    batch = {
+        "thought": "two angles at once",
+        "action": "call_tool",
+        "calls": [
+            {"tool": "search_evidence", "input": {"query": "gray sedan passengers"}},
+            {
+                "tool": "query_records",
+                "input": {
+                    "operation": "plate_sightings",
+                    "params": {"plate": "SYN4821", **MARCH14},
+                },
+            },
+        ],
+    }
+    repeat = tool_call("search_evidence", {"query": "gray sedan passengers"})
+    model = ScriptedModel(
+        plan=[batch, repeat, repeat],
+        synthesize=[answer_with([claim("A witness saw two people in a gray car.", "S1")])],
+    )
+    result, _ = run(model, fakes)
+    assert [r.tool for r in result.tool_calls] == ["search_evidence", "query_records"]
+    assert result.stop_reason == "repeated_calls"
+    assert result.answer["status"] == "answered"
+    assert len(model.of("plan")) == 3  # one batched step, then two repeats before stopping

@@ -41,6 +41,16 @@ DEFAULT_MODELS: dict[Provider, dict[Task, str]] = {
     "fake": dict.fromkeys(("extract", "caption", "adjudicate", "plan", "synthesize"), "fake"),
 }
 
+# Free-tier quotas are per model and small (a busy day can exhaust one), so each task has a
+# fallback chain. A model that answers 429 is skipped for the rest of the process.
+GEMINI_FALLBACKS: dict[Task, tuple[str, ...]] = {
+    "extract": ("gemini-3.1-flash-lite", "gemini-3-flash-preview"),
+    "caption": ("gemini-3.1-flash-lite", "gemini-3-flash-preview"),
+    "adjudicate": ("gemini-3.1-flash-lite", "gemini-3-flash-preview"),
+    "plan": ("gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
+    "synthesize": ("gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
+}
+
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
@@ -60,12 +70,27 @@ class RouterSettings(BaseSettings):
     llm_timeout_s: float = 120.0
     llm_context_tokens: int = 8192
     # Free-tier pacing: minimum seconds between hosted calls, and retries on HTTP 429 / 5xx.
-    llm_min_interval_s: float = 4.0
+    llm_min_interval_s: float = 4.0  # per model
+    # Gemini thinking: "minimal" keeps extraction / planning steps around 1.5 s; synthesis gets a
+    # little more room. None leaves the model default.
+    gemini_thinking_level: str | None = "minimal"
+    gemini_synthesize_thinking_level: str | None = "low"
     llm_rate_limit_retries: int = 5
+    # On 429 / repeated 5xx, move on to the task's next model instead of waiting.
+    gemini_fallback: bool = True
+    llm_overload_retries: int = 2
 
 
 class ModelError(RuntimeError):
     """The model call failed, or did not return valid JSON for the schema after one retry."""
+
+
+class _UnavailableError(ModelError):
+    """This model can't serve the call right now (quota or overload); another one may."""
+
+    def __init__(self, message: str, quota: bool) -> None:
+        super().__init__(message)
+        self.quota = quota
 
 
 def evidence_block(label: str, text: str) -> str:
@@ -97,7 +122,9 @@ class ModelRouter:
         self._fake = fake
         self._client = client
         self._sleep = sleep
-        self._last_call = 0.0
+        self._last_call: dict[str, float] = {}
+        self._exhausted: set[str] = set()
+        self.last_model: dict[Task, str] = {}
 
     def model_for(self, task: Task) -> str:
         override: str | None = getattr(self.settings, f"model_{task}")
@@ -142,26 +169,36 @@ class ModelRouter:
             return self._gemini(task, system, user, schema, images)
         return self._ollama(task, system, user, schema, images)
 
-    def _post(self, url: str, body: dict[str, Any], headers: dict[str, str]) -> Any:
+    def _post(
+        self, url: str, body: dict[str, Any], headers: dict[str, str], fail_over: bool = False
+    ) -> Any:
+        """POST with pacing. With `fail_over`, a 429 or persistent 5xx raises `_UnavailableError` at
+        once so the caller can try another model; otherwise both are retried with backoff."""
         s = self.settings
+        retries = s.llm_overload_retries if fail_over else s.llm_rate_limit_retries
         client = self._client or httpx.Client(timeout=s.llm_timeout_s)
         try:
-            for attempt in range(s.llm_rate_limit_retries + 1):
-                wait = self._last_call + s.llm_min_interval_s - time.monotonic()
+            for attempt in range(retries + 1):
+                wait = self._last_call.get(url, 0.0) + s.llm_min_interval_s - time.monotonic()
                 if wait > 0 and self.settings.llm_provider == "gemini":
                     self._sleep(wait)
-                self._last_call = time.monotonic()
+                self._last_call[url] = time.monotonic()
                 try:
                     response = client.post(url, json=body, headers=headers)
                 except httpx.HTTPError as exc:
                     raise ModelError(f"model request failed: {type(exc).__name__}") from exc
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if retryable and attempt < s.llm_rate_limit_retries:
-                    self._sleep(min(60.0, 5.0 * 2**attempt))
+                code = response.status_code
+                if code == 429 and fail_over:
+                    raise _UnavailableError("model request failed: HTTP 429", quota=True)
+                if (code == 429 or code >= 500) and attempt < retries:
+                    # 429 = quota: back off hard. 5xx = transient overload: retry quickly.
+                    self._sleep(min(60.0, (5.0 if code == 429 else 1.0) * 2**attempt))
                     continue
-                if response.status_code >= 400:
+                if code >= 500 and fail_over:
+                    raise _UnavailableError(f"model request failed: HTTP {code}", quota=False)
+                if code >= 400:
                     # Never echo request bodies or headers (they carry the key / evidence).
-                    raise ModelError(f"model request failed: HTTP {response.status_code}")
+                    raise ModelError(f"model request failed: HTTP {code}")
                 return response.json()
             raise ModelError("model request failed: retries exhausted")
         finally:
@@ -184,20 +221,45 @@ class ModelRouter:
             {"inline_data": {"mime_type": _image_mime(img), "data": base64.b64encode(img).decode()}}
             for img in images
         ]
+        generation: dict[str, Any] = {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema.model_json_schema(),
+        }
+        level = (
+            self.settings.gemini_synthesize_thinking_level
+            if task == "synthesize"
+            else self.settings.gemini_thinking_level
+        )
+        if level:
+            generation["thinkingConfig"] = {"thinkingLevel": level}
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": 0,
-                "responseMimeType": "application/json",
-                "responseJsonSchema": schema.model_json_schema(),
-            },
+            "generationConfig": generation,
         }
-        data = self._post(
-            GEMINI_URL.format(model=self.model_for(task)),
-            body,
-            {"x-goog-api-key": key.get_secret_value()},
-        )
+        chain = [self.model_for(task)]
+        if self.settings.gemini_fallback:
+            chain += [m for m in GEMINI_FALLBACKS[task] if m not in chain]
+        candidates = [m for m in chain if m not in self._exhausted] or chain[-1:]
+        data: Any = None
+        for i, model in enumerate(candidates):
+            last = i == len(candidates) - 1
+            try:
+                data = self._post(
+                    GEMINI_URL.format(model=model),
+                    body,
+                    {"x-goog-api-key": key.get_secret_value()},
+                    fail_over=not last,
+                )
+            except _UnavailableError as exc:
+                if exc.quota:
+                    self._exhausted.add(model)
+                continue
+            self.last_model[task] = model
+            break
+        if data is None:
+            raise ModelError("model request failed: every model in the chain is unavailable")
         try:
             parts_out = data["candidates"][0]["content"]["parts"]
         except (KeyError, IndexError, TypeError) as exc:
