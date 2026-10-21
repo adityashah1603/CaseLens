@@ -21,9 +21,10 @@ from caselens_api.auth import TokenVerifier, build_verifier
 from caselens_api.db import Database
 from caselens_api.deps import RateLimiter, Services
 from caselens_api.problems import ProblemError, install_problem_handlers, problem_response
-from caselens_api.routes import agent, audit, cases, evidence, graph, ingest
+from caselens_api.routes import agent, audit, cases, evidence, graph, ingest, storage
 from caselens_api.settings import Settings, get_settings
-from caselens_api.storage import EvidenceStore, S3EvidenceStore
+from caselens_api.storage import EvidenceStore, LocalDiskEvidenceStore, S3EvidenceStore
+from caselens_api.web import mount_spa
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,12 @@ def _warm_up_retrieval() -> None:
         warm_up()
     except Exception as exc:
         log.warning("retrieval model warm-up failed: %s", exc)
+
+
+def default_store_factory(settings: Settings) -> Callable[[], EvidenceStore]:
+    if settings.storage_backend == "local":
+        return lambda: LocalDiskEvidenceStore.from_settings(settings)
+    return lambda: S3EvidenceStore(settings)
 
 
 def create_app(
@@ -59,7 +66,7 @@ def create_app(
         settings=settings,
         verifier=verifier or build_verifier(settings),
         db=database,
-        store_factory=store_factory or (lambda: S3EvidenceStore(settings)),
+        store_factory=store_factory or default_store_factory(settings),
         ask_limiter=RateLimiter(settings.ask_rate_limit, settings.ask_rate_window_s),
         ask_slots=threading.BoundedSemaphore(settings.ask_max_concurrent),
         ask_kwargs=dict(ask_kwargs or {}),
@@ -116,6 +123,10 @@ def create_app(
 
     for module in (cases, evidence, ingest, agent, graph, audit):
         app.include_router(module.router)
+    if settings.storage_backend == "local":
+        app.include_router(storage.router)  # signed-URL emulation, not part of the API contract
+    if settings.web_dist is not None:
+        mount_spa(app, settings.web_dist)  # last: a catch-all that never shadows the routes above
     return app
 
 

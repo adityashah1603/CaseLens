@@ -55,3 +55,7 @@ data_gen/.cache/
 # Downloaded model weights (fastembed, whisper, YOLO, speechbrain)
 .cache/
 *.pt
+
+# ---- Hugging Face Space build inputs (infra/space/README.md) ----
+infra/space/evidence/
+infra/space/build/

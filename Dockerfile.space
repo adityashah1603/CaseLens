@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1
+# CaseLens public demo: one container for a Hugging Face Docker Space (D-066, infra/space/README.md).
+# FastAPI API + the built web app + the fastembed models + the 18 SYNTHETIC demo evidence files,
+# talking to a hosted Postgres (Neon). No workers, no object store, no secrets in the image.
+#
+#   python infra/space/export_evidence.py           # build input: infra/space/evidence/
+#   docker build -f Dockerfile.space -t caselens-space \
+#     --build-arg VITE_FIREBASE_API_KEY=... --build-arg VITE_FIREBASE_AUTH_DOMAIN=... \
+#     --build-arg VITE_FIREBASE_PROJECT_ID=... --build-arg VITE_FIREBASE_APP_ID=... .
+
+# ---- 1: web app ---------------------------------------------------------------------------
+FROM node:22-slim AS web
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=true
+WORKDIR /web
+RUN corepack enable
+COPY apps/web/package.json apps/web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY apps/web/ ./
+# Firebase *web* config: public identifiers, not secrets. Dev tokens never enter the build:
+# no .env files are in the build context (.dockerignore) and check:bundle fails on any JWT.
+ARG VITE_FIREBASE_API_KEY=""
+ARG VITE_FIREBASE_AUTH_DOMAIN=""
+ARG VITE_FIREBASE_PROJECT_ID=""
+ARG VITE_FIREBASE_APP_ID=""
+ENV VITE_FIREBASE_API_KEY=$VITE_FIREBASE_API_KEY \
+    VITE_FIREBASE_AUTH_DOMAIN=$VITE_FIREBASE_AUTH_DOMAIN \
+    VITE_FIREBASE_PROJECT_ID=$VITE_FIREBASE_PROJECT_ID \
+    VITE_FIREBASE_APP_ID=$VITE_FIREBASE_APP_ID
+RUN rm -f .env .env.local .env.production .env.production.local \
+ && pnpm build --mode production \
+ && pnpm check:bundle
+
+# ---- 2: Python runtime packages (API + agent + retrieval + semantic layer + workers core) ----
+FROM python:3.11-slim AS python
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+COPY infra/space/constraints.txt /src/constraints.txt
+COPY packages/agent /src/packages/agent
+COPY packages/retrieval /src/packages/retrieval
+COPY packages/semantic_layer /src/packages/semantic_layer
+COPY workers /src/workers
+COPY apps/api /src/apps/api
+# workers without its pdf / audio / video / extract extras: the API imports only its storage
+# keys, settings and pipeline graph (stage code imports heavy libraries lazily).
+RUN pip install -c /src/constraints.txt \
+      /src/packages/agent /src/packages/semantic_layer /src/packages/retrieval \
+      /src/workers /src/apps/api \
+ && python -c "import importlib.util as u, sys; bad = [m for m in ('torch', 'ultralytics', 'faster_whisper', 'speechbrain', 'fitz', 'cv2', 'rapidocr_onnxruntime') if u.find_spec(m)]; sys.exit(f'heavy packages in the image: {bad}' if bad else 0)"
+# Same models (and fastembed version) the demo case was embedded with.
+ENV CASELENS_MODEL_CACHE_DIR=/opt/models
+RUN python -c "from caselens_retrieval.encoders import warm_up; warm_up()" \
+ && find /opt/models -name '*.lock' -delete
+
+# ---- 3: runtime ---------------------------------------------------------------------------
+FROM python:3.11-slim
+# Hugging Face Spaces run the container as uid 1000.
+RUN useradd --create-home --uid 1000 caselens
+COPY --from=python /opt/venv /opt/venv
+COPY --from=python --chown=1000:1000 /opt/models /opt/models
+COPY --from=web /web/dist /app/web
+COPY infra/space/evidence /app/evidence
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HUB_OFFLINE=1 \
+    CASELENS_ENVIRONMENT=prod \
+    CASELENS_STORAGE_BACKEND=local \
+    CASELENS_LOCAL_STORAGE_ROOT=/app/evidence \
+    CASELENS_BUCKET=caselens-evidence \
+    CASELENS_WEB_DIST=/app/web \
+    CASELENS_ANONYMOUS_DEMO=true \
+    CASELENS_MODEL_CACHE_DIR=/opt/models \
+    CASELENS_LLM_PROVIDER=gemini \
+    CASELENS_TRUSTED_PROXY_HOPS=1 \
+    CASELENS_ASK_MAX_CONCURRENT=2
+USER caselens
+WORKDIR /home/caselens
+EXPOSE 7860
+CMD ["uvicorn", "caselens_api.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1", "--no-server-header"]

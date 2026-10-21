@@ -34,12 +34,18 @@ SELECT r.id, r.case_id, r.user_id, r.question, r.status, r.model, r.plan, r.tool
  WHERE r.case_id = %(case_id)s
 """
 # Demo users (is_demo) see only their own runs: only_user is their id, NULL for everyone else.
+# Anonymous demo visitors share that user, so they are further limited to the runs this process
+# recorded for them (only_ids; NULL for everyone else).
+_OWN_RUNS = """
+   AND (%(only_user)s::uuid IS NULL OR r.user_id = %(only_user)s::uuid)
+   AND (%(only_ids)s::uuid[] IS NULL OR r.id = ANY(%(only_ids)s::uuid[]))
+"""
 _RUN_ONE = (
     _RUN_SELECT
     + """
    AND r.id = %(run_id)s
-   AND (%(only_user)s::uuid IS NULL OR r.user_id = %(only_user)s::uuid)
 """
+    + _OWN_RUNS
 )
 _RUN_AFTER_FAILURE = (
     _RUN_SELECT
@@ -55,6 +61,7 @@ SELECT r.id, r.user_id, r.question, r.status, r.answer ->> 'status', r.model, r.
   FROM public.agent_runs AS r
  WHERE r.case_id = %(case_id)s
    AND (%(only_user)s::uuid IS NULL OR r.user_id = %(only_user)s::uuid)
+   AND (%(only_ids)s::uuid[] IS NULL OR r.id = ANY(%(only_ids)s::uuid[]))
    AND (%(c_ts)s::timestamptz IS NULL OR (r.created_at, r.id) < (%(c_ts)s, %(c_id)s::uuid))
  ORDER BY r.created_at DESC, r.id DESC
  LIMIT %(limit)s
@@ -119,18 +126,26 @@ def run_from_row(row: tuple[Any, ...]) -> m.AgentRun:
     )
 
 
-def own_runs_only(case: CaseSession) -> uuid.UUID | None:
-    """The shared demo login sees only its own runs, so visitors never see each other's
+def own_runs_only(case: CaseSession) -> dict[str, Any]:
+    """Run filters: the shared demo login sees only its own runs, and an anonymous demo
+    visitor only the runs it created in this process, so visitors never see each other's
     questions; every other member sees all runs in the case."""
-    return case.user.id if case.user.is_demo else None
+    return {
+        "only_user": case.user.id if case.user.is_demo else None,
+        "only_ids": (
+            case.services.visitor_runs.of(case.visitor) if case.visitor is not None else None
+        ),
+    }
 
 
 def load_run(
-    conn: Conn, case_id: uuid.UUID, run_id: uuid.UUID, only_user: uuid.UUID | None = None
+    conn: Conn,
+    case_id: uuid.UUID,
+    run_id: uuid.UUID,
+    filters: dict[str, Any] | None = None,
 ) -> m.AgentRun:
-    row = conn.execute(
-        _RUN_ONE, {"case_id": case_id, "run_id": run_id, "only_user": only_user}
-    ).fetchone()
+    params = {"only_user": None, "only_ids": None, **(filters or {})}
+    row = conn.execute(_RUN_ONE, {"case_id": case_id, "run_id": run_id, **params}).fetchone()
     if row is None:
         raise not_found("No such run.")
     return run_from_row(row)
@@ -187,7 +202,13 @@ def _run_ask(case: CaseSession, question: str) -> m.AgentRun:
             )
     except CaseAccessError as exc:
         raise not_found("No such case.") from exc
-    except Exception:
+    except Exception as exc:
+        if case.visitor is not None:
+            # Visitors share one user id, so the lookup below could find another visitor's
+            # run with the same question; report the failure without a run instead.
+            raise ProblemError(
+                503, "The investigator could not finish this question; try again shortly."
+            ) from exc
         # ask() marks the run failed before re-raising; return that run if it was created.
         row = case.conn.execute(
             _RUN_AFTER_FAILURE,
@@ -200,8 +221,16 @@ def _run_ask(case: CaseSession, question: str) -> m.AgentRun:
         ).fetchone()
         if row is None:
             raise
-        return run_from_row(row)
+        run = run_from_row(row)
+        _remember(case, run.id)
+        return run
+    _remember(case, result.run_id)
     return load_run(case.conn, case.case_id, result.run_id)
+
+
+def _remember(case: CaseSession, run_id: uuid.UUID) -> None:
+    if case.visitor is not None:
+        case.services.visitor_runs.add(case.visitor, run_id)
 
 
 @router.get("/runs", response_model=m.AgentRunList)
@@ -213,7 +242,7 @@ def list_runs(
         _RUN_PAGE,
         {
             "case_id": case.case_id,
-            "only_user": own_runs_only(case),
+            **own_runs_only(case),
             **cursor_params(after, ("c_ts", "c_id")),
             "limit": limit + 1,
         },

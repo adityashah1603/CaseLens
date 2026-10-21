@@ -61,8 +61,9 @@ cannot be checked); locally it logs a warning, so a `.env` without `CASELENS_API
 | `auth.py` | token verifiers (Firebase RS256 / local HS256 dev), user resolve-or-create by `oidc_subject` |
 | `deps.py` | services on `app.state`, the per-request session, case role checks, `/ask` rate limiter |
 | `problems.py` | RFC 9457 `application/problem+json` for every error (422 carries `errors[{loc,msg}]`) |
-| `storage.py` | evidence store interface: streaming put, streaming SHA-256, signed GET URL (MinIO / memory) |
-| `routes/` | `cases` (me, cases, members), `evidence`, `ingest` (SSE), `agent`, `graph` (timeline, entities, graph, conflicts), `audit` (case + admin) |
+| `storage.py` | evidence store interface: streaming put, streaming SHA-256, signed GET URL (MinIO / local disk with HMAC tokens / memory) |
+| `routes/` | `cases` (me, cases, members), `evidence`, `ingest` (SSE), `agent`, `graph` (timeline, entities, graph, conflicts), `audit` (case + admin), `storage` (local-disk signed URLs, outside the contract) |
+| `web.py` | serves the built web app at `/` when `CASELENS_WEB_DIST` is set (index.html fallback, never shadows `/v1`, `/healthz`, `/storage`) |
 | `testing.py` | contract checker (responses vs. `openapi.yaml`) and a SYNTHETIC test world |
 
 ## Security model
@@ -75,13 +76,22 @@ cannot be checked); locally it logs a warning, so a `.env` without `CASELENS_API
   to start with a dev secret in any other environment (with or without a Firebase project). Dev
   tokens are minted only by the CLI.
   On first sign-in the `users` row is created as `caselens_app` (users RLS allows it).
+  Firebase *anonymous* tokens (`firebase.sign_in_provider == "anonymous"`) never get a row of their
+  own: with `CASELENS_ANONYMOUS_DEMO=true` (the public demo, D-066) they act as the pre-provisioned
+  shared demo viewer (`oidc_subject` `demo:viewer`, `is_demo`; 503 if it is missing), so every demo
+  restriction applies; otherwise they get 401.
 * **Never the owner.** Every request runs as `caselens_app` with `app.user_id` set; `/ask` adds a
   second checkout as `caselens_readonly` for semantic-layer SQL. RLS is the second wall.
 * **Roles.** Non-members get 404 on every case route (existence never leaks); too-low roles get 403.
   Lead: case update, members, audit. Analyst+: upload, entity-link revert. Viewer+: everything else,
   including `/ask`. The demo user (`users.is_demo`) cannot create cases, cannot be added or
   promoted above viewer (403), and sees only its own runs (`GET /runs` lists the caller's runs,
-  `GET /runs/{id}` of another user's run is 404). Admin routes need `users.is_admin`.
+  `GET /runs/{id}` of another user's run is 404). Anonymous visitors share that user, so they are
+  limited further to the runs they created in this process (an in-memory, bounded map from the
+  Firebase uid to run ids; `agent_runs` has no visitor column): another visitor's run is 404 and
+  after a restart the list is empty, which leaks nothing between visitors. A visitor's failed
+  `/ask` answers 503 instead of looking the failed run up by question. Admin routes need
+  `users.is_admin`.
 * **Audit.** Written as the user, in the same transaction as the action: `case.create`,
   `case.update`, `member.add|update|remove`, `evidence.upload`, `evidence.view` (content redirect,
   with `integrity_ok`), `timeline.view`, `entity_link.revert`, `audit.view`, `admin.audit.view`,
@@ -95,6 +105,16 @@ cannot be checked); locally it logs a warning, so a `.env` without `CASELENS_API
   browser (127.0.0.1:9000 in docker compose). No pool connection is held while hashing: the route
   checks membership and reads the evidence row, returns the connection, hashes, then writes the
   `evidence.view` audit row as the user in a short new session before answering.
+* **Local-disk store** (`CASELENS_STORAGE_BACKEND=local`, the single-container demo). Objects live
+  under `CASELENS_LOCAL_STORAGE_ROOT` by the same keys as the `s3://bucket/key` URIs (bucket must
+  equal `CASELENS_BUCKET`), with a `<file>.meta.json` content-type sidecar. The 307 target is
+  `<CASELENS_PUBLIC_BASE_URL>/storage/<token>` (relative when unset): `token =
+  base64url(expiry LF key) . base64url(HMAC-SHA256(CASELENS_STORAGE_SIGNING_SECRET, ...))`, the
+  secret required (32+ characters) with this backend. `GET|HEAD /storage/{token}` is **not part of
+  the API contract**: it emulates the object store's signed URL (no bearer token, like S3), checks
+  the MAC in constant time and the expiry, then serves the file with its content type,
+  `Cache-Control: no-store`, `nosniff` and Range support (206 / 416) for audio and video seeking.
+  Bad, tampered or expired tokens get 403; keys are validated against path traversal.
 
 ## Behaviour notes
 

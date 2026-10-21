@@ -1,0 +1,37 @@
+# Build context for Dockerfile.space (the Hugging Face Space image). Allow-list: only the sources
+# the image needs, so .env files, keys, model caches, data_gen output and node_modules never
+# enter the context.
+*
+!Dockerfile.space
+!infra/space/constraints.txt
+!infra/space/evidence/
+!apps/api/pyproject.toml
+!apps/api/caselens_api/
+!packages/agent/pyproject.toml
+!packages/agent/caselens_agent/
+!packages/retrieval/pyproject.toml
+!packages/retrieval/caselens_retrieval/
+!packages/semantic_layer/pyproject.toml
+!packages/semantic_layer/caselens_semantic_layer/
+!workers/pyproject.toml
+!workers/caselens_workers/
+!apps/web/package.json
+!apps/web/pnpm-lock.yaml
+!apps/web/index.html
+!apps/web/tsconfig*.json
+!apps/web/vite.config.ts
+!apps/web/scripts/
+!apps/web/src/
+!apps/web/public/
+
+# Never, even inside allowed directories.
+**/.env
+**/.env.*
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/node_modules
+**/dist
+**/.cache
+**/*.pem
+**/*.key

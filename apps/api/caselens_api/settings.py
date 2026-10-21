@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +14,7 @@ DEFAULT_ENVIRONMENT = "prod"
 # Pool connections beyond the two each in-flight /ask holds (request + read-only SQL), for the
 # other endpoints and SSE polls.
 POOL_HEADROOM = 4
+MIN_SIGNING_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -39,8 +42,18 @@ class Settings(BaseSettings):
     # verifier only when environment == "local" (refused at startup otherwise).
     firebase_project_id: str | None = None
     dev_auth_secret: SecretStr | None = None
+    # Public demo (D-066): a verified Firebase *anonymous* token is served as the shared demo
+    # viewer user (oidc_subject "demo:viewer"). Off -> anonymous tokens are rejected with 401.
+    anonymous_demo: bool = False
 
-    # Object storage (same variables as the workers' WorkerSettings).
+    # Object storage. "s3": MinIO / S3 (same variables as the workers' WorkerSettings).
+    # "local": files under local_storage_root by object key, served by GET /storage/<token>
+    # with HMAC-signed, expiring tokens (the free single-container demo, D-066).
+    storage_backend: Literal["s3", "local"] = "s3"
+    local_storage_root: Path | None = None
+    storage_signing_secret: SecretStr | None = None
+    # Prefix of the signed /storage URLs ("" = same-origin relative URLs).
+    public_base_url: str = ""
     s3_endpoint: str = "127.0.0.1:9000"
     s3_access_key: str | None = None
     s3_secret_key: str | None = None
@@ -49,6 +62,9 @@ class Settings(BaseSettings):
     bucket: str = "caselens-evidence"
     signed_url_ttl_s: int = 300
     max_upload_bytes: int = 500 * 1024 * 1024
+
+    # Built web app (apps/web/dist) served at / with index.html fallback; unset = API only.
+    web_dist: Path | None = None
 
     # Browser origins allowed by CORS (the Vite dev server by default).
     cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
@@ -86,6 +102,17 @@ class Settings(BaseSettings):
             )
         if self.trusted_proxy_hops < 0:
             raise ValueError("CASELENS_TRUSTED_PROXY_HOPS must not be negative")
+        if self.storage_backend == "local":
+            if self.local_storage_root is None:
+                raise ValueError(
+                    "CASELENS_LOCAL_STORAGE_ROOT is required with storage_backend=local"
+                )
+            secret = self.storage_signing_secret
+            if secret is None or len(secret.get_secret_value()) < MIN_SIGNING_SECRET_LENGTH:
+                raise ValueError(
+                    "CASELENS_STORAGE_SIGNING_SECRET must be at least "
+                    f"{MIN_SIGNING_SECRET_LENGTH} characters with storage_backend=local"
+                )
         return self
 
     @property

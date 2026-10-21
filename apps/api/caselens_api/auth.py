@@ -10,6 +10,10 @@ Two verifiers behind one interface:
 
 After verification the API resolves (or creates, on first sign-in) the `users` row by
 `oidc_subject` as `caselens_app`, which the users RLS policies allow.
+
+Firebase *anonymous* tokens (`firebase.sign_in_provider == "anonymous"`) never get a users
+row of their own: with CASELENS_ANONYMOUS_DEMO=true they act as the shared, pre-provisioned demo
+viewer (oidc_subject `demo:viewer`, is_demo), and without it they are rejected (401).
 """
 
 from __future__ import annotations
@@ -34,6 +38,8 @@ FIREBASE_JWKS_URL = (
     "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
 )
 CLOCK_SKEW_S = 30
+ANONYMOUS_PROVIDER = "anonymous"
+DEMO_VIEWER_SUBJECT = "demo:viewer"
 
 
 class TokenIdentity(BaseModel):
@@ -42,6 +48,12 @@ class TokenIdentity(BaseModel):
     subject: str
     email: str | None = None
     display_name: str | None = None
+    # Firebase `firebase.sign_in_provider` ("anonymous", "password", "google.com", ...).
+    sign_in_provider: str | None = None
+
+    @property
+    def is_anonymous(self) -> bool:
+        return self.sign_in_provider == ANONYMOUS_PROVIDER
 
 
 class TokenVerifier(Protocol):
@@ -138,7 +150,12 @@ class FirebaseTokenVerifier:
         auth_time = claims.get("auth_time")
         if isinstance(auth_time, int | float) and auth_time > time.time() + CLOCK_SKEW_S:
             raise AuthError("auth_time is in the future")
-        return _identity(claims, trust_email=claims.get("email_verified") is True)
+        identity = _identity(claims, trust_email=claims.get("email_verified") is True)
+        firebase = claims.get("firebase")
+        provider = firebase.get("sign_in_provider") if isinstance(firebase, dict) else None
+        if isinstance(provider, str) and provider:
+            identity.sign_in_provider = provider
+        return identity
 
 
 class CompositeVerifier:
@@ -232,6 +249,15 @@ def _select_user(conn: Conn, subject: str) -> UserRow | None:
         is_admin=row[4],
         created_at=row[5],
     )
+
+
+def resolve_demo_viewer(conn: Conn) -> UserRow:
+    """The shared demo viewer that anonymous visitors act as. It is provisioned with the demo
+    case (infra/space/load_neon.py), never created here; anything else is a server error."""
+    user = _select_user(conn, DEMO_VIEWER_SUBJECT)
+    if user is None or not user.is_demo or user.is_admin:
+        raise ProblemError(503, "The public demo is not available.")
+    return user
 
 
 def resolve_user(conn: Conn, identity: TokenIdentity) -> UserRow:
