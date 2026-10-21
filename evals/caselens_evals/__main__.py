@@ -1,19 +1,16 @@
+"""`python -m caselens_evals [run|score|report|smoke|full]`; no command = the smoke eval."""
+
 import sys
-from pathlib import Path
+from collections.abc import Sequence
 
-GOLD_DIR = Path(__file__).resolve().parents[1] / "gold"
+from caselens_evals.cli import main as cli_main
 
 
-def main() -> int:
-    gold_files = sorted(GOLD_DIR.glob("*.jsonl"))
-    if not gold_files:
-        print("caselens-evals: no gold set yet; smoke eval skipped (passes).")
-        return 0
-    print(
-        f"caselens-evals: {len(gold_files)} gold file(s) found but no runner yet.",
-        file=sys.stderr,
-    )
-    return 1
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or (args[0].startswith("-") and args[0] not in ("-h", "--help")):
+        args = ["smoke", *args]
+    return cli_main(args)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,14 @@ name = "caselens-evals"
 version = "0.0.1"
 description = "CaseLens eval harness."
 requires-python = ">=3.11"
-dependencies = ["caselens-workers", "caselens-data-gen"]
+dependencies = [
+  "caselens-workers",
+  "caselens-data-gen",
+  "caselens-agent",
+  "caselens-semantic-layer",
+  "caselens-retrieval",
+  "jsonschema",
+]
 
 [tool.setuptools.packages.find]
 include = ["caselens_evals*"]

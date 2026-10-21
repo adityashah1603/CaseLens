@@ -39,7 +39,7 @@ make up        # Postgres 16 + pgvector, MinIO
 make migrate   # apply the schema
 make test      # all tests
 make lint      # ruff, mypy, eslint, tsc
-make eval      # eval harness (stub)
+make eval      # smoke eval: 10 gold questions (make eval-full: all 50 + README table)
 ```
 
 ## See it working (ingest the demo case)
@@ -83,3 +83,9 @@ Pick a dev identity on the sign-in screen (lead, analyst, or the read-only demo 
 and ask a question.
 
 Contributor and agent rules are in `CLAUDE.md`.
+
+## Evaluation
+
+<!-- eval-results:start -->
+No scored run published yet: `make eval-full` (or `python -m caselens_evals report --readme`) writes the results table here.
+<!-- eval-results:end -->

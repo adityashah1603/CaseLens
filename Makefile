@@ -14,7 +14,7 @@ WEB    := apps/web
 -include .env
 export
 
-.PHONY: help install env up down migrate test test-py test-web lint lint-py lint-web fmt eval
+.PHONY: help install env up down migrate test test-py test-web lint lint-py lint-web fmt eval eval-full
 
 help:
 	@echo "install  create .venv and install Python + web deps"
@@ -24,7 +24,8 @@ help:
 	@echo "test     Python tests (incl. DB contract tests when CASELENS_TEST_DATABASE_URL is set) + web tests"
 	@echo "lint     ruff + mypy --strict + eslint + tsc"
 	@echo "fmt      auto-format Python"
-	@echo "eval     run the eval harness (stub until the gold set exists)"
+	@echo "eval     smoke eval: 10 gold questions, scored (skips without DB / model key)"
+	@echo "eval-full  all 50 gold questions, scored, results table written to README.md"
 
 install:
 	test -d .venv || $(PYTHON) -m venv .venv
@@ -68,4 +69,7 @@ fmt:
 	$(PY) -m ruff format .
 
 eval:
-	$(PY) -m caselens_evals
+	$(PY) -m caselens_evals smoke
+
+eval-full:
+	$(PY) -m caselens_evals full
