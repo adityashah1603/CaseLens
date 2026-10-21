@@ -28,6 +28,8 @@ out.model_dump(mode="json")  # validates against the tool's output_schema
   the stored JSON stay absent. Filter times must carry a UTC offset (naive times are rejected
   instead of silently shifted).
 - `embed_query(text)` gives the 768-dim BAAI/bge-base-en-v1.5 vector (same model as ingest).
+- `caselens_retrieval.encoders.warm_up()` loads the embedder and reranker up front. A cold process
+  otherwise pays about 7 s on its first search; call it at server start-up.
 - Fakes for tests: pass `embedder=` / `reranker=` per call, or `set_default_embedder` /
   `set_default_reranker` process-wide. `rerank=False` returns RRF scores; `timings=SearchTimings()`
   is filled with embed / SQL / rerank milliseconds.

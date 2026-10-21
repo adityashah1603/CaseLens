@@ -6,7 +6,10 @@ decides whether the user may run on the case at all:
 * start: INSERT agent_runs (status 'running') + audit `agent.ask`
 * each tool call: UPDATE agent_runs.tool_calls (allowed by migration 0002 while the run is
   'running') + audit `agent.tool_call` (tool, input, counts; never evidence text)
-* end: UPDATE agent_runs with answer, citations, status, model, plan, latency
+* end: UPDATE agent_runs with answer, citations, status, model, plan, latency, and token usage
+  (input_tokens / output_tokens summed over the run's model calls; cost_usd is 0 on the free
+  tier, else the list-price estimate). plan.usage keeps the per-call breakdown and the
+  list-price estimate (`list_price_usd_estimate`, for reporting only).
 
 `query_records` runs on the separate `caselens_readonly` connection.
 """
@@ -44,6 +47,7 @@ class AgentResult:
     stop_reason: str
     fell_back: bool
     validation_errors: list[list[str]] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 def _clip_strings(value: Any, limit: int = AUDIT_INPUT_STRING_LIMIT) -> Any:
@@ -160,17 +164,24 @@ def ask(
 
     latency = int((time.monotonic() - start) * 1000)
     status = "failed" if result.model_failed else "succeeded"
+    usage = result.usage.summary()
     plan = {
         "thoughts": [_clip_strings(t, 1000) for t in result.thoughts],
         "stop_reason": result.stop_reason,
         "validation_errors": result.validation_errors,
         "fell_back": result.fell_back,
+        "prefetched_steps": result.prefetched_steps,
+        "quotes_dropped": result.quotes_dropped,
+        "usage": usage,
     }
+    estimate = result.usage.list_price_usd()
+    cost = 0.0 if router.settings.llm_free_tier else estimate
     model = model_label(router)
     with app_conn.transaction():
         app_conn.execute(
             "UPDATE public.agent_runs SET status = %s, model = %s, plan = %s, tool_calls = %s, "
-            "answer = %s, citations = %s, latency_ms = %s WHERE id = %s",
+            "answer = %s, citations = %s, latency_ms = %s, input_tokens = %s, "
+            "output_tokens = %s, cost_usd = %s WHERE id = %s",
             (
                 status,
                 model,
@@ -179,6 +190,9 @@ def ask(
                 Jsonb(result.answer),
                 Jsonb(result.answer["citations"]),
                 latency,
+                result.usage.input_tokens,
+                result.usage.output_tokens,
+                cost,
                 run_id,
             ),
         )
@@ -193,4 +207,5 @@ def ask(
         stop_reason=result.stop_reason,
         fell_back=result.fell_back,
         validation_errors=result.validation_errors,
+        usage=usage,
     )

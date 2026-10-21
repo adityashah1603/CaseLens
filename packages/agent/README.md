@@ -24,10 +24,11 @@ plus audit rows, which is normal app behavior.
 | `tools.py` | One executor per contract tool. Input is checked against the contract `input_schema` (jsonschema 2020-12, formats on) before anything runs. Output is checked against `output_schema` before the model sees it. A bad input, an unknown tool, a backend error or a DB error becomes an error observation for the model and never crashes the run. |
 | `sources.py` | `SourceLedger`: every citable source a tool returned in the run gets a short handle (`S1`, `S2`, ...), and stored conflicts get `F1`, `F2`, .... Observations show handles and locators, never chunk or record UUIDs. |
 | `prompts.py` | System prompts (the citation-or-refuse policy and the evidence-is-data rule) and the JSON shapes the model returns (`AgentAction`, `DraftAnswer`). |
-| `loop.py` | `AgentLoop`: up to 8 tool calls and a transcript budget of about 120k characters, then synthesis, validation, one corrective retry, and otherwise `insufficient_evidence`. Every attempt counts toward the 8, including invalid ones. `compose_answer` expands handles into contract citations. |
+| `prefetch.py` | The retrieval-first fast path: `prefetch_calls(question)` = `search_evidence` + `search_video` on the question, plus `get_entity` for up to 2 `salient_terms` (phone numbers, plate-like tokens, capitalized names / places, "<color> <vehicle>"). A plain heuristic, no model. |
+| `loop.py` | `AgentLoop`: prefetch, then model turns, up to 8 tool calls in total (prefetched ones included) and a transcript budget of about 120k characters. A turn can call tools, `finish`, or `answer` directly. Every draft (direct or synthesized) is validated, with one corrective retry in total, and otherwise `insufficient_evidence`. Every attempt counts toward the 8, including invalid ones. `compose_answer` expands handles into contract citations. |
 | `validator.py` | `validate_answer(answer, ledger)`: the answer schema plus the runtime rules below. |
 | `runner.py` | `ask(app_conn, readonly_conn, case_id, user_id, question, router=None, backends=None)`: the audited run. |
-| `testing.py` | `ScriptedModel` (a fake router responder) and `FakeBackends` for tests. SYNTHETIC data only. |
+| `testing.py` | `ScriptedModel` (a fake router responder; planning turns, meaning schema `AgentAction`, take the `plan` script) and `FakeBackends` for tests. SYNTHETIC data only. Tests that script every tool call pass `AgentConfig(prefetch=False)`. |
 
 ### Tools
 
@@ -63,9 +64,11 @@ The guide mentions the Anthropic tool-use API. The loop uses a provider-neutral 
 through `ModelRouter.complete_json` instead. That keeps Gemini (free tier, the default), Claude and a
 self-hosted model swappable by config, with no tool plumbing per provider:
 
-- Task `plan`, at each step: the model returns
-  `{"thought": ..., "action": "call_tool", "tool": ..., "input": {...}}` or `{"action": "finish"}`,
-  validated by Pydantic. The tool definitions (name, description and `input_schema` from the contract)
+- Each turn the model returns an `AgentAction`, validated by Pydantic:
+  `{"thought": ..., "action": "call_tool", "calls": [{"tool": ..., "input": {...}}, ...]}`,
+  `{"action": "finish"}`, or `{"action": "answer", "answer": <draft>}` (the same draft shape as
+  synthesis, which saves the separate synthesis call). The first turn after the prefetch uses
+  the `synthesize` router task (more thinking, since it often answers); later turns use `plan`. The tool definitions (name, description and `input_schema` from the contract)
   are listed in the system prompt. For `flag_conflict`, the `source_refs` items are shown as handles.
 - Tool results go back as JSON inside `evidence_block(...)`. Text is clipped to 600 characters per
   item, and the whole observation to 8000 characters by dropping trailing items. Errors go back as
@@ -112,8 +115,84 @@ patched up.
 - **End:** it stores status, model, plan (thoughts, stop reason, validator errors), tool calls,
   answer, citations and latency. The row is then frozen.
 
-Token counts and cost stay null because the router does not report usage yet. If every synthesis
-attempt fails with a model error, the run is stored as `failed` with the fallback answer.
+If every synthesis attempt fails with a model error, the run is stored as `failed` with the
+fallback answer.
+
+### Usage and cost
+
+`complete_json(..., meter=UsageMeter())` records one `CallUsage` per model reply: task, the
+model that answered (after fallback), latency, and tokens from Gemini `usageMetadata`
+(`promptTokenCount`; output = `candidatesTokenCount` + `thoughtsTokenCount`) or Ollama
+(`prompt_eval_count` / `eval_count`). The fake model reports 0. `ask()` stores:
+
+- `agent_runs.input_tokens` / `output_tokens`: sums over the run's model calls.
+- `agent_runs.cost_usd`: 0 on the free tier (`CASELENS_LLM_FREE_TIER=true`, the default), else
+  the list-price estimate.
+- `plan.usage`: `model_calls`, the token totals, `list_price_usd_estimate` and the per-call
+  breakdown. The estimate uses `router.LIST_PRICES_USD_PER_MTOK`. These are **assumed paid-tier
+  prices for reporting only** (Flash-Lite $0.10 / $0.40, 3.5 Flash $0.30 / $2.50, 3 Flash $0.50 /
+  $3.00 per million input / output tokens); update the table if Google's prices differ. It is
+  null when a model has no known price.
+- `plan.prefetched_steps` and `plan.quotes_dropped` (see Latency).
+
+## Latency
+
+Target (guide): p50 < 8 s, p95 < 20 s end to end. Before this work a run made about 4 to 6
+sequential model calls (one planning turn per tool batch, then synthesis, often a validator
+retry), plus a 4 s per-model pacing gap and about 0.7 s per search. What changed:
+
+1. **Retrieval-first prefetch** (`prefetch.py`): the opening searches run before the first model
+   call (about 1.1 s warm: search_evidence ~0.65 s, search_video ~0.45 s, get_entity ~0.05 s).
+   They run sequentially on the run's single RLS connection; running them in parallel would need
+   a second connection per run to save about 0.4 s. Prefetched calls are normal, audited tool
+   calls, they count toward the 8, and the model is told not to repeat them.
+2. **Direct answers**: a turn may return the final draft (`"action": "answer"`), so a typical
+   question is prefetch, then 1 turn for any record query, then 1 turn that answers: 2 model
+   calls instead of 4 to 6.
+3. **Open-question follow-up** (quality guard, `AgentConfig.follow_open_questions`): once per run,
+   an `answered` direct draft that still lists open questions while tool calls remain is sent
+   back once ("call a tool that settles them, or repeat the answer"). If nothing new is observed,
+   that draft is kept with no extra synthesis call.
+4. **Quote repair** (`loop.repair_quotes`): an optional quote that is not a verbatim excerpt of
+   its source is trimmed of wrapping quotation marks / ellipses, or else set to null, before
+   validation. Paraphrased quotes caused most validator retries (a full extra model call). The
+   citation itself (the source handle) is untouched and the validator still runs unchanged on
+   the result, so no unverified quote ever reaches the answer. The count is stored as
+   `plan.quotes_dropped`.
+5. **Router pacing**: plan / synthesize skip the fixed 4 s interval
+   (`CASELENS_LLM_AGENT_MIN_INTERVAL_S=0`; ingest / judge tasks keep `CASELENS_LLM_MIN_INTERVAL_S`).
+   A router shared by many runs (the eval harness) still keeps each agent model under
+   `CASELENS_LLM_AGENT_RPM=10` requests per rolling minute.
+6. **429 cooldowns**: a model that answers 429 is skipped by every router in the process (the
+   API builds one router per request) for Gemini's `RetryInfo.retryDelay`, an hour for a
+   per-day `QuotaFailure`, else 60 s (`CASELENS_LLM_QUOTA_COOLDOWN_S` /
+   `CASELENS_LLM_QUOTA_DAY_COOLDOWN_S`). Before, every question re-probed spent models (about
+   0.3 to 0.6 s each). Only those fields of the 429 body are read and nothing is logged. A router
+   with an injected HTTP client (tests) gets its own cooldown table.
+7. **Agent timeout fail-over**: a plan / synthesize request slower than
+   `CASELENS_LLM_AGENT_TIMEOUT_S=30` moves to the next model in the chain (not a cooldown).
+8. Cold start: the first search in a process loads the embedder and reranker (about 7 s). Call
+   `caselens_retrieval.encoders.warm_up()` at server start-up. The numbers below are warm.
+
+Measured on the dev DB (demo case, one warm process, free Gemini tier, 2026-10-20). Model
+calls are successful replies (fast 429s on spent models not counted). Most "after" calls fell
+back to gemini-3.5-flash-lite because the shared key's 3.5-flash / 3-flash-preview daily quota
+was spent:
+
+| Question | Before | Model calls | After | Model calls |
+| --- | --- | --- | --- | --- |
+| Who was in the gray sedan on March 14? | 26 to 105 s (4 earlier runs) | about 5 to 7 (estimated from 7 to 8 tool calls) | 8.4 s / 11.1 s | 2 / 3 |
+| How many times did Kemper and Hale call each other in the week before the shooting? | 18.1 s | 4 | 7.0 s | 2 |
+| When was plate SYN4821 read entering and leaving the Riverside Lot? | n/a | n/a | 6.6 s | 2 |
+| What is Travis Kemper's blood type? (unanswerable) | 25.6 s | 4 | 6.1 s | 2 |
+| What time did the gray car arrive at the lot? | 14.1 s | 4 | 6.3 s | 2 |
+
+All "after" answers were correct and cited: 7 calls with CDR rows, the SYN4821 22:41:05 / 22:47:31
+plate reads, `insufficient_evidence` with no claims for the blood type, and 22:41 for the
+arrival. On flash-lite, the north-star answer names Kemper and the two-occupant conflict but
+leaves the passenger unidentified. An earlier 3.5-flash run named Rory Vance, after 8 tool calls
+and 96 s. This is a model-strength gap that is still open: re-measure when the 3.5-flash quota is
+available.
 
 ## Contracts (frozen; changes need tech-lead approval)
 
@@ -143,8 +222,20 @@ them in sync.
   - the 8-call cap,
   - prompt injection inside evidence,
   - `flag_conflict` handles and the rule that flagged conflicts must be surfaced.
+- `tests/test_fast_path.py` (fast; fake router, fake backends, mock HTTP) covers:
+  - `salient_terms` / `prefetch_calls`,
+  - prefetch followed by a direct answer in 1 model call,
+  - a prefetched call never being repeated,
+  - a rejected direct answer getting one corrective synthesis, then `insufficient_evidence`,
+  - the open-question follow-up (it can call tools, is sent once, keeps the draft on finish),
+  - quote repair,
+  - Gemini usage reaching the meter and the list-price estimate,
+  - agent pacing and the per-minute cap,
+  - 429 cooldowns shared across routers (retryDelay and per-day quota),
+  - timeout fail-over.
 - `tests/test_agent_db.py` (`db` marker) covers:
   - `get_entity` and `get_timeline` SQL against SYNTHETIC rows,
-  - `ask()` writing the run, tool calls, conflict and audit rows as `caselens_app`,
+  - `ask()` writing the run, tool calls, conflict and audit rows (and token / cost columns) as
+    `caselens_app`,
   - a finished run being frozen,
   - a non-member being refused by RLS.

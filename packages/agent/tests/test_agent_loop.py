@@ -59,6 +59,8 @@ def run(
     conn = FakeConn()
     ctx = ToolContext(cast(Conn, conn), cast(Conn, conn), CASE, agent_run_id=None)
     runtime = ToolRuntime(ctx, fakes.backends())
+    # These tests script every step, so the retrieval-first prefetch is off unless asked for.
+    config = config or AgentConfig(prefetch=False)
     return AgentLoop(model.router(), runtime, config).run(question), conn
 
 

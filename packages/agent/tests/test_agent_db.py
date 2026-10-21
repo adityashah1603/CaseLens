@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from psycopg.types.json import Jsonb
 
+from caselens_agent.loop import AgentConfig
 from caselens_agent.runner import CaseAccessError, ask
 from caselens_agent.testing import FakeBackends, ScriptedModel, evidence_result, tool_call
 from caselens_agent.tools import (
@@ -243,6 +244,7 @@ def test_ask_writes_run_tool_calls_conflict_and_audit_as_app(
         "Who drove the gray sedan?",
         router=model.router(),
         backends=fakes.backends(),
+        config=AgentConfig(prefetch=False),  # the script covers every tool call
     )
 
     assert result.status == "succeeded" and not result.fell_back
@@ -258,6 +260,13 @@ def test_ask_writes_run_tool_calls_conflict_and_audit_as_app(
     # one citation with the quote, one without (claims vs conflict sides)
     assert row[:5] == ("succeeded", user_id, 3, "answered", 2)
     assert row[5] == "fake:fake" and row[6] is not None and row[7] is True
+    usage = conn.execute(
+        "SELECT input_tokens, output_tokens, cost_usd, plan -> 'usage' -> 'model_calls' "
+        "FROM public.agent_runs WHERE id = %s",
+        (result.run_id,),
+    ).fetchone()
+    # the fake model reports no tokens; 3 planning turns + finish + 1 synthesis = 5 calls
+    assert usage is not None and usage[:3] == (0, 0, 0) and usage[3] == 5
 
     conflict = conn.execute(
         "SELECT id::text, agent_run_id, status, claim_a -> 'source_refs' -> 0 ->> 'chunk_id' "

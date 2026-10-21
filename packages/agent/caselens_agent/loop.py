@@ -1,10 +1,13 @@
 """The investigator agent loop: plan -> act -> observe -> reflect, then synthesize + validate.
 
-The loop talks to the model only through `ModelRouter.complete_json` with Pydantic-validated
-JSON actions (task "plan" per step, "synthesize" for the answer). Tool results go back to the
-model as `evidence_block(...)`-wrapped JSON with source handles; the runtime expands the handles
-the model cites into contract citations and runs the validator. One corrective retry, then the
-answer falls back to `insufficient_evidence`.
+Fast path first: before any model call the runtime runs `prefetch_calls(question)` (search the
+evidence and the video for the question, look up the names / plates / phones it mentions), so
+the first model turn already sees observations. Each turn the model returns a Pydantic-validated
+JSON action: more tool calls, `finish` (a separate "synthesize" call writes the answer), or
+`answer` with the final draft itself (saves that call). Tool results go back to the model as
+`evidence_block(...)`-wrapped JSON with source handles; the runtime expands the handles the model
+cites into contract citations and runs the validator on every draft, direct or synthesized. One
+corrective retry in total, then the answer falls back to `insufficient_evidence`.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from caselens_agent.prefetch import prefetch_calls
 from caselens_agent.prompts import (
     AgentAction,
     DraftAnswer,
@@ -23,8 +27,8 @@ from caselens_agent.prompts import (
     plan_system,
     synth_system,
 )
-from caselens_agent.router import ModelError, ModelRouter, evidence_block
-from caselens_agent.sources import SourceLedger, fit_observation
+from caselens_agent.router import ModelError, ModelRouter, Task, UsageMeter, evidence_block
+from caselens_agent.sources import SourceLedger, fit_observation, normalize_ws
 from caselens_agent.tools import ToolOutcome, ToolRuntime
 from caselens_agent.validator import insufficient_evidence, validate_answer
 
@@ -40,6 +44,15 @@ class AgentConfig:
     max_transcript_chars: int = 120_000
     max_observation_chars: int = 8_000
     validator_retries: int = 1
+    # Retrieval-first fast path: tool calls run before the first model turn (they count toward
+    # max_tool_calls), with up to `prefetch_entities` get_entity lookups.
+    prefetch: bool = True
+    prefetch_entities: int = 2
+    # Router task for the first turn after a prefetch (it often writes the answer directly).
+    first_turn_task: Task = "synthesize"
+    # Once per run, a direct answer that still lists open questions while tool calls remain is
+    # sent back once: "call a tool that settles them, or repeat the answer".
+    follow_open_questions: bool = True
 
 
 @dataclass
@@ -82,15 +95,21 @@ class LoopResult:
     fell_back: bool = False
     model_failed: bool = False
     stop_reason: str = "finish"
+    usage: UsageMeter = field(default_factory=UsageMeter)
+    prefetched_steps: int = 0
+    quotes_dropped: int = 0
 
 
 def _call_key(tool: str, tool_input: Any) -> str:
     return json.dumps({"tool": tool, "input": tool_input}, ensure_ascii=False, sort_keys=True)
 
 
-def _render_step(step: int, call_obj: PlannedCall, outcome: ToolOutcome, limit: int) -> str:
+def _render_step(
+    step: int, call_obj: PlannedCall, outcome: ToolOutcome, limit: int, auto: bool = False
+) -> str:
     call = json.dumps({"tool": call_obj.tool, "input": call_obj.input}, ensure_ascii=False)
-    head = f"Step {step}: you called {call}"
+    who = "the system ran (before your first turn)" if auto else "you called"
+    head = f"Step {step}: {who} {call}"
     if not outcome.ok:
         return f"{head}\nTool error: {outcome.error}"
     body = fit_observation(outcome.observation or {}, limit)
@@ -180,6 +199,41 @@ def compose_answer(draft: DraftAnswer, ledger: SourceLedger) -> tuple[dict[str, 
     return answer, errors
 
 
+# Quotation marks and ellipses a model may wrap around a quote (ASCII and typographic).
+_QUOTE_MARKS = "'." + "".join(map(chr, (0x22, 0x201C, 0x201D, 0x2018, 0x2019, 0x2026)))
+
+
+def repair_quotes(draft: DraftAnswer, ledger: SourceLedger) -> int:
+    """Null out quotes that are not verbatim excerpts of their source, in place; returns how many.
+
+    Only the optional quote text goes: the citation (the source handle) stays and is validated as
+    usual, and no unverified quote ever reaches the answer. Quotes that only differ by wrapping
+    quotation marks or ellipses are trimmed to the verbatim part instead. This saves a corrective
+    model call for the most common slip (a paraphrased "quote").
+    """
+    dropped = 0
+    items: list[DraftCitation] = [c for claim in draft.claims for c in claim.citations]
+    for cf in draft.conflicts:
+        items += cf.claim_a.citations + cf.claim_b.citations
+    for item in items:
+        if not item.quote or not item.quote.strip():
+            continue
+        observed = ledger.get(item.source)
+        if observed is None:
+            continue  # an unknown handle is reported by compose_answer
+        texts = [normalize_ws(t) for t in observed.texts]
+        trimmed = item.quote.strip().strip(_QUOTE_MARKS).strip()
+        for candidate in (item.quote, trimmed):
+            needle = normalize_ws(candidate)
+            if needle and any(needle in t for t in texts):
+                item.quote = candidate
+                break
+        else:
+            item.quote = None
+            dropped += 1
+    return dropped
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -210,9 +264,39 @@ class AgentLoop:
             parts.append("No tools called yet.")
         return "\n\n".join(parts)
 
+    def _execute(
+        self,
+        call_obj: PlannedCall,
+        records: list[ToolCallRecord],
+        steps: list[str],
+        auto: bool = False,
+    ) -> None:
+        step = len(records) + 1
+        outcome = self.runtime.call(call_obj.tool, call_obj.input)
+        output = outcome.output or {}
+        record = ToolCallRecord(
+            step=step,
+            tool=call_obj.tool,
+            input=call_obj.input,
+            ok=outcome.ok,
+            error=outcome.error,
+            result_count=outcome.result_count,
+            sources=outcome.handles,
+            duration_ms=outcome.duration_ms,
+            sql=output.get("sql") if call_obj.tool == "query_records" else None,
+            conflict_id=output.get("conflict_id") if call_obj.tool == "flag_conflict" else None,
+        )
+        records.append(record)
+        steps.append(
+            _render_step(step, call_obj, outcome, self.config.max_observation_chars, auto=auto)
+        )
+        if self.on_tool_call is not None:
+            self.on_tool_call(record)
+
     def run(self, question: str) -> LoopResult:
         cfg = self.config
         ledger = self.runtime.ledger
+        meter = UsageMeter()
         steps: list[str] = []
         records: list[ToolCallRecord] = []
         thoughts: list[str] = []
@@ -220,7 +304,18 @@ class AgentLoop:
         system = plan_system(cfg.max_tool_calls)
         seen: dict[str, int] = {}
         repeats = 0
+        direct: DraftAnswer | None = None
 
+        if cfg.prefetch:
+            for call_obj in prefetch_calls(question, cfg.prefetch_entities)[: cfg.max_tool_calls]:
+                seen[_call_key(call_obj.tool, call_obj.input)] = len(records) + 1
+                self._execute(call_obj, records, steps, auto=True)
+        prefetched = len(records)
+
+        turn = 0
+        nudge = ""  # one-off note for the next turn
+        nudged: DraftAnswer | None = None  # the direct answer that was sent back, as a fallback
+        nudged_at = 0  # tool calls made when it was sent back
         while len(records) < cfg.max_tool_calls:
             transcript = self._transcript(question, steps)
             if len(transcript) > cfg.max_transcript_chars:
@@ -228,14 +323,41 @@ class AgentLoop:
                 break
             remaining = cfg.max_tool_calls - len(records)
             user = f"{transcript}\n\nTool calls left: {remaining}. Reply with your next action."
+            if nudge:
+                user, nudge = f"{user}\n\n{nudge}", ""
+            # The first turn often writes the answer itself, so it gets the synthesis model
+            # settings; later turns only pick tools and use the faster planning settings.
+            task: Task = cfg.first_turn_task if turn == 0 and prefetched else "plan"
+            turn += 1
             try:
-                action = self.router.complete_json("plan", system, user, AgentAction)
+                action = self.router.complete_json(task, system, user, AgentAction, meter=meter)
             except ModelError:
                 stop_reason = "model_error"
                 break
             thoughts.append(action.thought)
+            if action.action == "answer" and action.answer is not None:
+                draft = action.answer
+                gaps = [q.strip() for q in draft.open_questions if q.strip()]
+                if (
+                    cfg.follow_open_questions
+                    and nudged is None
+                    and draft.status == "answered"
+                    and gaps
+                ):
+                    nudged, nudged_at = draft, len(records)
+                    listed = "; ".join(g[:200] for g in gaps[:5])
+                    nudge = (
+                        f"Your draft answer leaves these open: {listed}. If a tool call you have "
+                        "not tried could settle one (follow names, numbers, plates, places or "
+                        "receipts in the observations), call it now. Otherwise reply with the "
+                        "same answer."
+                    )
+                    continue
+                direct = draft
+                stop_reason = "answer"
+                break
             planned = action.planned_calls()
-            if action.action == "finish" or not planned:
+            if action.action != "call_tool" or not planned:
                 stop_reason = "finish"
                 break
             fresh = False
@@ -250,35 +372,35 @@ class AgentLoop:
                     )
                     continue
                 fresh = True
-                step = len(records) + 1
-                seen[key] = step
-                outcome = self.runtime.call(call_obj.tool, call_obj.input)
-                output = outcome.output or {}
-                record = ToolCallRecord(
-                    step=step,
-                    tool=call_obj.tool,
-                    input=call_obj.input,
-                    ok=outcome.ok,
-                    error=outcome.error,
-                    result_count=outcome.result_count,
-                    sources=outcome.handles,
-                    duration_ms=outcome.duration_ms,
-                    sql=output.get("sql") if call_obj.tool == "query_records" else None,
-                    conflict_id=output.get("conflict_id")
-                    if call_obj.tool == "flag_conflict"
-                    else None,
-                )
-                records.append(record)
-                steps.append(_render_step(step, call_obj, outcome, cfg.max_observation_chars))
-                if self.on_tool_call is not None:
-                    self.on_tool_call(record)
+                seen[key] = len(records) + 1
+                self._execute(call_obj, records, steps)
             if not fresh:
                 repeats += 1
                 if repeats >= 2:  # the model keeps repeating itself: stop and answer
                     stop_reason = "repeated_calls"
                     break
 
-        answer, errors_log, fell_back, model_failed = self._synthesize(question, steps, ledger)
+        if direct is None and nudged is not None and len(records) == nudged_at:
+            # Nothing new was observed after the nudge (finish, model error): keep that draft.
+            direct = nudged
+            stop_reason = "answer"
+        errors_log: list[list[str]] = []
+        quotes_dropped = 0
+        answer: dict[str, Any] | None = None
+        fell_back = model_failed = False
+        if direct is not None:
+            quotes_dropped = repair_quotes(direct, ledger)
+            composed, errors = compose_answer(direct, ledger)
+            errors += validate_answer(composed, ledger)
+            if errors:
+                errors_log.append(errors)  # counts as the first synthesis attempt
+            else:
+                answer = composed
+        if answer is None:
+            answer, errors_log, fell_back, model_failed, dropped = self._synthesize(
+                question, steps, ledger, meter, errors_log
+            )
+            quotes_dropped += dropped
         return LoopResult(
             answer=answer,
             tool_calls=records,
@@ -288,11 +410,19 @@ class AgentLoop:
             fell_back=fell_back,
             model_failed=model_failed,
             stop_reason=stop_reason,
+            usage=meter,
+            prefetched_steps=prefetched,
+            quotes_dropped=quotes_dropped,
         )
 
     def _synthesize(
-        self, question: str, steps: list[str], ledger: SourceLedger
-    ) -> tuple[dict[str, Any], list[list[str]], bool, bool]:
+        self,
+        question: str,
+        steps: list[str],
+        ledger: SourceLedger,
+        meter: UsageMeter,
+        prior_errors: list[list[str]],
+    ) -> tuple[dict[str, Any], list[list[str]], bool, bool, int]:
         transcript = self._transcript(question, steps)
         handles = ", ".join(ledger.handles()) or "(none)"
         flags = ", ".join(f"{f.handle} ({f.description[:120]})" for f in ledger.flagged.values())
@@ -301,9 +431,11 @@ class AgentLoop:
             f"Conflicts recorded with flag_conflict: {flags or '(none)'}\n\n"
             "Write the final answer JSON now."
         )
-        errors_log: list[list[str]] = []
+        errors_log = list(prior_errors)
         model_errors = 0
-        attempts = 1 + self.config.validator_retries
+        dropped = 0
+        # A rejected direct answer already used the first attempt.
+        attempts = max(1, 1 + self.config.validator_retries - len(prior_errors))
         for _ in range(attempts):
             user = base
             if errors_log:
@@ -313,21 +445,25 @@ class AgentLoop:
                     f"{listed}\nFix every error. Drop any claim you cannot cite."
                 )
             try:
-                draft = self.router.complete_json("synthesize", synth_system(), user, DraftAnswer)
+                draft = self.router.complete_json(
+                    "synthesize", synth_system(), user, DraftAnswer, meter=meter
+                )
             except ModelError as exc:
                 model_errors += 1
                 errors_log.append([f"model error: {exc}"[:300]])
                 continue
+            dropped += repair_quotes(draft, ledger)
             answer, errors = compose_answer(draft, ledger)
             errors += validate_answer(answer, ledger)
             if not errors:
-                return answer, errors_log, False, False
+                return answer, errors_log, False, False, dropped
             errors_log.append(errors)
         reason = (
             "The model could not produce an answer."
-            if model_errors == attempts
+            if model_errors == attempts and not prior_errors
             else "The drafted answer failed citation validation twice, so it was withheld: "
             "every claim must cite a source returned by the tools in this run."
         )
+        failed = model_errors == attempts and not prior_errors
         fallback = insufficient_evidence(reason, ledger)
-        return fallback, errors_log, True, model_errors == attempts
+        return fallback, errors_log, True, failed, dropped

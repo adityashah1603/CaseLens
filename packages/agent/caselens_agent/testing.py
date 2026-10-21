@@ -25,18 +25,24 @@ class Call:
 
 @dataclass
 class ScriptedModel:
-    """Replays scripted JSON replies per task. A reply may be a callable of the user prompt.
-    When a task's script runs out, `plan` finishes and `synthesize` repeats its last reply."""
+    """Replays scripted JSON replies. A reply may be a callable of the user prompt.
+
+    Planning turns (schema AgentAction, whatever the router task) take the `plan` script; answer
+    drafts take `synthesize`. When the plan script runs out the model finishes; the synthesize
+    script repeats its last reply."""
 
     plan: list[Reply] = field(default_factory=list)
     synthesize: list[Reply] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
+    turns: list[bool] = field(default_factory=list)  # per call: was it a planning turn
 
     def __call__(self, task: Task, system: str, user: str, schema: type[BaseModel]) -> str:
         self.calls.append(Call(task, system, user))
-        n = sum(1 for c in self.calls if c.task == task) - 1
-        script = self.plan if task == "plan" else self.synthesize
-        if task == "plan" and n >= len(script):
+        planning = schema.__name__ == "AgentAction"
+        self.turns.append(planning)
+        n = sum(1 for t in self.turns if t == planning) - 1
+        script = self.plan if planning else self.synthesize
+        if planning and n >= len(script):
             return json.dumps({"thought": "done", "action": "finish"})
         reply = script[min(n, len(script) - 1)]
         return json.dumps(reply(user) if callable(reply) else reply)

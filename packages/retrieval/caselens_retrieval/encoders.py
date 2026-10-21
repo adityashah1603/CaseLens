@@ -87,3 +87,12 @@ def default_reranker() -> Reranker | None:
 def embed_query(text: str) -> list[float]:
     """Embed a query with the ingest model (768-dim BAAI/bge-base-en-v1.5 by default)."""
     return default_embedder()(text)
+
+
+def warm_up() -> None:
+    """Load the query embedder and reranker now (about 7 s on a cold CPU process) instead of on
+    the first question. Call it at server start-up; it is a no-op cost afterwards."""
+    default_embedder()("warm up")
+    reranker = default_reranker()
+    if reranker is not None:
+        reranker("warm up", ["warm up"])
