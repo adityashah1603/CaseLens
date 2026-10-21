@@ -215,9 +215,16 @@ def migrate(owner_url: str, conn: Conn) -> None:
 # ---- 2: API login --------------------------------------------------------------------------
 
 
+def _is_neon(conn: Conn) -> bool:
+    return bool(conn.info.host and conn.info.host.endswith(".neon.tech"))
+
+
 def ensure_api_login(conn: Conn, password: str) -> None:
     login = sql.Identifier(API_LOGIN)
-    verifier = sql.Literal(scram_verifier(password))
+    # Neon's control plane rejects pre-hashed verifiers ("only supports plaintext passwords")
+    # and hashes the password itself; the connection is TLS (sslmode=require), so it is never
+    # sent in the clear. Elsewhere send a SCRAM verifier so the server never sees plaintext.
+    verifier = sql.Literal(password if _is_neon(conn) else scram_verifier(password))
     exists = conn.execute(
         "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s", (API_LOGIN,)
     ).fetchone()
