@@ -16,9 +16,12 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from caselens_agent.prefetch import prefetch_calls
+from caselens_agent.crosscheck import cross_check_note
+from caselens_agent.prefetch import names_records, prefetch_calls
 from caselens_agent.prompts import (
     AgentAction,
     DraftAnswer,
@@ -48,11 +51,16 @@ class AgentConfig:
     # max_tool_calls), with up to `prefetch_entities` get_entity lookups.
     prefetch: bool = True
     prefetch_entities: int = 2
+    # Also prefetch the record operation (query_records) for the phones / plates / item tags a
+    # question names, windowed by the dates and times it names.
+    prefetch_records: bool = True
     # Router task for the first turn after a prefetch (it often writes the answer directly).
     first_turn_task: Task = "synthesize"
     # Once per run, a direct answer that still lists open questions while tool calls remain is
     # sent back once: "call a tool that settles them, or repeat the answer".
     follow_open_questions: bool = True
+    # Append the deterministic cross-check of observed sources (crosscheck.py) to the transcript.
+    cross_check: bool = True
 
 
 @dataclass
@@ -100,6 +108,13 @@ class LoopResult:
     quotes_dropped: int = 0
 
 
+def _zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
 def _call_key(tool: str, tool_input: Any) -> str:
     return json.dumps({"tool": tool, "input": tool_input}, ensure_ascii=False, sort_keys=True)
 
@@ -111,7 +126,10 @@ def _render_step(
     who = "the system ran (before your first turn)" if auto else "you called"
     head = f"Step {step}: {who} {call}"
     if not outcome.ok:
-        return f"{head}\nTool error: {outcome.error}"
+        # Error text can echo values the model wrote or a backend saw: data, never instructions.
+        return f"{head}\nTool error:\n" + evidence_block(
+            f"{outcome.tool} error, step {step}", outcome.error or "unknown error"
+        )
     body = fit_observation(outcome.observation or {}, limit)
     return f"{head}\n" + evidence_block(f"{outcome.tool} result, step {step}", body)
 
@@ -170,7 +188,7 @@ def compose_answer(draft: DraftAnswer, ledger: SourceLedger) -> tuple[dict[str, 
             flagged = ledger.flagged.get(cf.flag.strip().upper())
             if flagged is None:
                 errors.append(f"conflict cf{i} names unknown flag {cf.flag!r}")
-            else:
+            elif flagged.stored:
                 record_id = flagged.conflict_id
         conflicts.append(
             {
@@ -260,6 +278,9 @@ class AgentLoop:
         if steps:
             parts.append("Tool calls so far:")
             parts.extend(steps)
+            note = cross_check_note(self.runtime.ledger) if self.config.cross_check else None
+            if note:
+                parts.append(note)
         else:
             parts.append("No tools called yet.")
         return "\n\n".join(parts)
@@ -284,7 +305,10 @@ class AgentLoop:
             sources=outcome.handles,
             duration_ms=outcome.duration_ms,
             sql=output.get("sql") if call_obj.tool == "query_records" else None,
-            conflict_id=output.get("conflict_id") if call_obj.tool == "flag_conflict" else None,
+            # A demo user's flag_conflict stores nothing: no record id to log.
+            conflict_id=output.get("conflict_id")
+            if call_obj.tool == "flag_conflict" and self.runtime.ctx.persist_conflicts
+            else None,
         )
         records.append(record)
         steps.append(
@@ -307,7 +331,12 @@ class AgentLoop:
         direct: DraftAnswer | None = None
 
         if cfg.prefetch:
-            for call_obj in prefetch_calls(question, cfg.prefetch_entities)[: cfg.max_tool_calls]:
+            tz = _zone(cfg.case_timezone)
+            year: int | None = None
+            if cfg.prefetch_records and names_records(question):
+                year = self.runtime.case_year() or datetime.now(tz).year
+            planned = prefetch_calls(question, cfg.prefetch_entities, tz=tz, year=year)
+            for call_obj in planned[: cfg.max_tool_calls]:
                 seen[_call_key(call_obj.tool, call_obj.input)] = len(records) + 1
                 self._execute(call_obj, records, steps, auto=True)
         prefetched = len(records)
@@ -345,12 +374,13 @@ class AgentLoop:
                     and gaps
                 ):
                     nudged, nudged_at = draft, len(records)
-                    listed = "; ".join(g[:200] for g in gaps[:5])
+                    listed = "\n".join(f"- {g[:200]}" for g in gaps[:5])
                     nudge = (
-                        f"Your draft answer leaves these open: {listed}. If a tool call you have "
-                        "not tried could settle one (follow names, numbers, plates, places or "
-                        "receipts in the observations), call it now. Otherwise reply with the "
-                        "same answer."
+                        "Your draft answer leaves these open:\n"
+                        + evidence_block("open questions of your draft", listed)
+                        + "\nIf a tool call you have not tried could settle one (follow names, "
+                        "numbers, plates, places or receipts in the observations), call it now. "
+                        "Otherwise reply with the same answer."
                     )
                     continue
                 direct = draft
@@ -425,10 +455,15 @@ class AgentLoop:
     ) -> tuple[dict[str, Any], list[list[str]], bool, bool, int]:
         transcript = self._transcript(question, steps)
         handles = ", ".join(ledger.handles()) or "(none)"
-        flags = ", ".join(f"{f.handle} ({f.description[:120]})" for f in ledger.flagged.values())
+        flags = "\n".join(f"{f.handle}: {f.description[:120]}" for f in ledger.flagged.values())
+        flagged = (
+            evidence_block("conflicts recorded with flag_conflict (handle: description)", flags)
+            if flags
+            else "(none)"
+        )
         base = (
             f"{transcript}\n\nCitable source handles: {handles}\n"
-            f"Conflicts recorded with flag_conflict: {flags or '(none)'}\n\n"
+            f"Conflicts recorded with flag_conflict: {flagged}\n\n"
             "Write the final answer JSON now."
         )
         errors_log = list(prior_errors)
@@ -442,7 +477,8 @@ class AgentLoop:
                 listed = "\n".join(f"- {e}" for e in errors_log[-1][:15])
                 user = (
                     f"{base}\n\nYour previous answer was rejected by the citation validator:\n"
-                    f"{listed}\nFix every error. Drop any claim you cannot cite."
+                    + evidence_block("validator errors", listed)
+                    + "\nFix every error. Drop any claim you cannot cite."
                 )
             try:
                 draft = self.router.complete_json(

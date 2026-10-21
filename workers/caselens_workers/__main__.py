@@ -5,6 +5,7 @@ python -m caselens_workers run --once            # drain the queue, then exit
 python -m caselens_workers run --pool gpu        # only ASR / diarize / detect / track / caption
 python -m caselens_workers status
 python -m caselens_workers requeue <evidence_id> <stage>
+python -m caselens_workers relink-vehicles --case-id <case_id>   # description -> plate links
 """
 
 from __future__ import annotations
@@ -116,6 +117,15 @@ def cmd_requeue(args: argparse.Namespace, settings: WorkerSettings) -> int:
     return 0 if ok else 1
 
 
+def cmd_relink_vehicles(args: argparse.Namespace, settings: WorkerSettings) -> int:
+    from caselens_workers.resolve import relink_vehicles
+
+    with worker_connection(settings) as conn, conn.transaction():
+        made = relink_vehicles(conn, uuid.UUID(args.case_id))
+    print(f"linked {made} vehicle description(s) to plates")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="caselens_workers", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -141,6 +151,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("evidence_id")
     p.add_argument("stage")
     p.set_defaults(func=cmd_requeue)
+
+    p = sub.add_parser(
+        "relink-vehicles",
+        help="link vehicle descriptions to plates from existing mentions (no LLM, insert-only)",
+    )
+    p.add_argument("--case-id", required=True)
+    p.set_defaults(func=cmd_relink_vehicles)
 
     args = parser.parse_args(argv)
     result: int = args.func(args, WorkerSettings())

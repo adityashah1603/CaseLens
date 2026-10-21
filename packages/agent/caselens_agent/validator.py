@@ -9,8 +9,9 @@ Checks, in order (see `answer.schema.json` description and SYSTEM_DESIGN 7d):
 4. Provenance: every citation matches a source a tool returned in this run, with the same
    chunk / record id, evidence id and locator.
 5. A non-null `quote` is a whitespace-normalized substring of text the tool returned for it.
-6. Conflicts: `conflict_record_id` must be an id `flag_conflict` returned in this run, and an
-   `answered` answer surfaces every conflict flagged in the run (never silently resolved).
+6. Conflicts: `conflict_record_id` must be an id `flag_conflict` stored in this run, and an
+   `answered` answer surfaces every conflict flagged in the run (never silently resolved). A
+   demo user's flags are not stored: each needs its own conflict with a null record id.
 7. Ids are unique within their arrays.
 
 Returns a list of human-readable errors; an empty list means the answer may be shown.
@@ -134,11 +135,19 @@ def validate_answer(answer: Any, ledger: SourceLedger) -> list[str]:
             surfaced.add(record_id)
     if answer["status"] == "answered":
         for f in ledger.flagged.values():
-            if f.conflict_id not in surfaced:
+            if f.stored and f.conflict_id not in surfaced:
                 errors.append(
-                    f"conflict {f.handle} ({f.description[:80]}) was flagged in this run but "
-                    "is not shown in conflicts[]"
+                    f"conflict {f.handle} was flagged in this run but is not shown in "
+                    "conflicts[] (give it that flag handle)"
                 )
+        # Unstored (demo-user) flags have no record id: each still needs its own conflict.
+        unstored = [f.handle for f in ledger.flagged.values() if not f.stored]
+        unlinked = sum(1 for c in conflicts if c.get("conflict_record_id") is None)
+        if len(unstored) > unlinked:
+            errors.append(
+                f"conflicts {', '.join(unstored)} were flagged in this run but not all are "
+                "shown in conflicts[]"
+            )
     return errors
 
 

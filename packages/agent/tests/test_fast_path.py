@@ -317,7 +317,11 @@ def test_open_questions_get_one_follow_up_turn_that_can_call_tools() -> None:
         ]
     )
     result = run(model, fakes, AgentConfig())
-    assert "leaves these open: Who was the passenger?" in model.calls[1].user
+    assert "leaves these open:" in model.calls[1].user
+    # The gaps are model-written text that may echo evidence: quoted as data.
+    assert "<<<EVIDENCE open questions of your draft\n- Who was the passenger?" in (
+        model.calls[1].user
+    )
     assert "leaves these open" not in model.calls[2].user  # the note is one-off
     assert len(model.calls) == 3 and result.stop_reason == "answer"
     assert [c.tool for c in result.tool_calls][-1] == "search_evidence"

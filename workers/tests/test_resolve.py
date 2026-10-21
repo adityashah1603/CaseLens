@@ -306,3 +306,120 @@ def test_names_with_different_numbers_never_match() -> None:
         == 0.0
     )
     assert name_score("location", "unit 14", "larkspur court apartments unit 14") > 0.9
+
+
+# ---------------------------------------------------------------- vehicle description -> plate
+
+
+def test_plate_compatibility() -> None:
+    from caselens_workers.resolve import plate_compatibility
+
+    civic = {"color": "gray", "make": "Honda", "model": "Civic"}
+    assert plate_compatibility({"color": "gray", "make": "Honda"}, "SYN4821", civic)
+    assert plate_compatibility({"color": "gray or silver"}, "SYN4821", civic)
+    assert plate_compatibility({"plate": "SYN48", "color": "grey"}, "SYN4821", civic)
+    assert plate_compatibility({"plate": "SYN4821 (CA)"}, "SYN4821", {})
+    assert plate_compatibility({"plate": "UNKNOWN", "make": "Honda"}, "SYN4821", civic)
+    # A disagreeing color, make or plate blocks the link; no positive agreement blocks it too.
+    assert not plate_compatibility({"color": "blue", "make": "Honda"}, "SYN4821", civic)
+    assert not plate_compatibility({"color": "gray", "make": "Toyota"}, "SYN4821", civic)
+    assert not plate_compatibility({"plate": "SYN2290"}, "SYN4821", civic)
+    assert not plate_compatibility({}, "SYN4821", civic)
+    assert not plate_compatibility({"color": "gray"}, "SYN4821", {})
+
+
+def _chunk(conn: Conn, case_id: uuid.UUID, index: int) -> uuid.UUID:
+    row = conn.execute(
+        "SELECT id FROM public.evidence WHERE case_id = %s LIMIT 1", (case_id,)
+    ).fetchone()
+    assert row is not None
+    chunk_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO public.chunks (id, case_id, evidence_id, modality, chunk_index, text, "
+        "locator) VALUES (%s, %s, %s, 'pdf', %s, 'SYNTHETIC', '{\"kind\": \"pdf\", \"page\": 1}')",
+        (chunk_id, case_id, row[0], index),
+    )
+    return chunk_id
+
+
+@pytest.mark.db
+def test_descriptions_link_to_their_co_mentioned_plate(
+    owner_conn: Conn, case_id: uuid.UUID
+) -> None:
+    from caselens_workers.resolve import add_mention, link_vehicle_plates
+
+    civic_attrs = {"plate": "SYN4821", "color": "gray", "make": "Honda", "model": "Civic"}
+    camry_attrs = {"plate": "SYN2290", "color": "blue", "make": "Toyota", "model": "Camry"}
+    civic = ensure_entity(owner_conn, case_id, "vehicle", "SYN4821", "SYN4821", civic_attrs)
+    camry = ensure_entity(owner_conn, case_id, "vehicle", "SYN2290", "SYN2290", camry_attrs)
+    gray = ensure_entity(
+        owner_conn, case_id, "vehicle", "gray Honda Civic", "desc:gray honda civic",
+        {"color": "gray", "make": "Honda"},
+    )  # fmt: skip
+    car = ensure_entity(owner_conn, case_id, "vehicle", "a car", "desc:a car", {})
+    tagged = ensure_entity(
+        owner_conn, case_id, "vehicle", "the Civic", "desc:the civic", {"plate": "SYN4821 (CA)"}
+    )
+    both = _chunk(owner_conn, case_id, 0)  # mentions both plates, the description and "a car"
+    for entity in (civic, camry, gray, car):
+        add_mention(owner_conn, case_id, entity, both, "x", 1.0)
+
+    assert link_vehicle_plates(owner_conn, case_id, [gray, car, tagged]) == 2
+    # gray Honda -> SYN4821 (the blue Toyota disagrees); "a car" has nothing to agree on; "the
+    # Civic" names its plate in its attributes (no shared chunk needed).
+    assert sorted(_links(owner_conn, case_id)) == [
+        ("gray Honda Civic", "SYN4821", "fuzzy"),
+        ("the Civic", "SYN4821", "fuzzy"),
+    ]
+    # Insert-only and idempotent; a reverted link is never re-made.
+    assert link_vehicle_plates(owner_conn, case_id, [gray, car, tagged]) == 0
+    # An analyst's revert (the worker role may only INSERT links, so do it as the owner here).
+    role = owner_conn.execute("SELECT current_user").fetchone()
+    as_role(owner_conn, None)
+    owner_conn.execute(
+        "UPDATE public.entity_links SET status = 'reverted', reverted_at = now() "
+        "WHERE from_entity_id = %s",
+        (gray,),
+    )
+    if role is not None and role[0] != "caselens":
+        as_role(owner_conn, role[0])
+    assert link_vehicle_plates(owner_conn, case_id, [gray]) == 0
+    # The standalone re-link pass over the whole case finds nothing new either.
+    from caselens_workers.resolve import relink_vehicles
+
+    assert relink_vehicles(owner_conn, case_id) == 0
+
+
+@pytest.mark.db
+def test_a_description_next_to_two_matching_plates_is_not_linked(
+    owner_conn: Conn, case_id: uuid.UUID
+) -> None:
+    from caselens_workers.resolve import add_mention, link_vehicle_plates
+
+    attrs = {"color": "gray"}
+    a = ensure_entity(owner_conn, case_id, "vehicle", "SYN1111", "SYN1111", attrs)
+    b = ensure_entity(owner_conn, case_id, "vehicle", "SYN2222", "SYN2222", attrs)
+    desc = ensure_entity(owner_conn, case_id, "vehicle", "gray car", "desc:gray car", attrs)
+    chunk = _chunk(owner_conn, case_id, 0)
+    for entity in (a, b, desc):
+        add_mention(owner_conn, case_id, entity, chunk, "x", 1.0)
+    assert link_vehicle_plates(owner_conn, case_id, [desc]) == 0
+    assert _links(owner_conn, case_id) == []
+
+
+@pytest.mark.db
+def test_relink_vehicles_covers_the_whole_case(owner_conn: Conn, case_id: uuid.UUID) -> None:
+    from caselens_workers.resolve import add_mention, relink_vehicles
+
+    plate = ensure_entity(
+        owner_conn, case_id, "vehicle", "SYN4821", "SYN4821", {"color": "gray", "make": "Honda"}
+    )
+    desc = ensure_entity(
+        owner_conn, case_id, "vehicle", "gray car", "desc:gray car", {"color": "gray"}
+    )
+    chunk = _chunk(owner_conn, case_id, 0)
+    for entity in (plate, desc):
+        add_mention(owner_conn, case_id, entity, chunk, "x", 1.0)
+    assert relink_vehicles(owner_conn, case_id) == 1
+    assert relink_vehicles(owner_conn, case_id) == 0
+    assert _links(owner_conn, case_id) == [("gray car", "SYN4821", "fuzzy")]

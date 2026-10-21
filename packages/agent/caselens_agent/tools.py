@@ -13,6 +13,7 @@ the result against the contract `output_schema` before the model sees it.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
@@ -105,6 +106,9 @@ class ToolContext:
     readonly_conn: Conn
     case_id: uuid.UUID
     agent_run_id: uuid.UUID | None = None
+    # False for the shared demo user (users.is_demo): flag_conflict checks the claims and
+    # returns a handle but writes nothing, so visitors never write into the shared demo case.
+    persist_conflicts: bool = True
 
 
 @dataclass
@@ -134,12 +138,48 @@ def _validators() -> dict[str, tuple[Draft202012Validator, Draft202012Validator]
     }
 
 
+_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _describe(err: Any) -> str:
+    """A schema error without the offending value: jsonschema messages quote the instance,
+    which may be model-written text copied from evidence. Only schema-side facts are named."""
+    kind = str(err.validator)
+    expected = err.validator_value
+    if kind == "required" and isinstance(expected, list) and isinstance(err.instance, dict):
+        missing = [str(k) for k in expected if k not in err.instance]
+        return "missing required properties: " + ", ".join(missing)
+    if kind == "additionalProperties" and isinstance(err.schema, dict):
+        allowed = sorted(str(k) for k in err.schema.get("properties", {}))
+        return "unexpected properties; allowed: " + ", ".join(allowed)
+    if kind in (
+        "type",
+        "format",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "const",
+        "uniqueItems",
+    ):
+        shown = json.dumps(expected, ensure_ascii=True)[:80]
+        return f"value fails {kind} {shown}"
+    if kind == "enum" and isinstance(expected, list):
+        return "value must be one of " + json.dumps(expected, ensure_ascii=True)[:200]
+    return f"value fails the {kind} constraint"
+
+
 def _schema_errors(validator: Draft202012Validator, value: Any, limit: int = 5) -> list[str]:
     errors = sorted(validator.iter_errors(value), key=lambda e: list(e.absolute_path))
     out = []
     for err in errors[:limit]:
-        path = "/".join(str(p) for p in err.absolute_path) or "(root)"
-        out.append(f"{path}: {err.message[:200]}")
+        parts = [str(p) for p in err.absolute_path]
+        # Path parts are property names or indexes; anything else is model-written: hide it.
+        path = "/".join(p if p.isdigit() or _SAFE_KEY.match(p) else "?" for p in parts)
+        out.append(f"{path or '(root)'}: {_describe(err)}")
     return out
 
 
@@ -440,6 +480,10 @@ def flag_conflict(
             observed = ledger.find(parsed)
             if observed is None or observed.ref != parsed:
                 raise ToolError(f"{side}: source was not returned by a tool in this run")
+    if not ctx.persist_conflicts:
+        # Demo user: nothing is stored; the handle only ties the answer's conflict to this call
+        # (its conflict_record_id stays null).
+        return {"conflict_id": str(uuid.uuid4()), "status": "open"}
     row = ctx.app_conn.execute(
         _INSERT_CONFLICT,
         {
@@ -475,6 +519,18 @@ class ToolRuntime:
         self.backends = backends
         self.ledger = ledger or SourceLedger()
         self.definitions = load_tool_definitions()
+
+    def case_year(self) -> int | None:
+        """The year of the case's latest timed chunk (dates in questions rarely give one)."""
+        try:
+            with self.ctx.app_conn.transaction():
+                row = self.ctx.app_conn.execute(
+                    "SELECT max(t_start) FROM public.chunks WHERE case_id = %s", (self.ctx.case_id,)
+                ).fetchone()
+        except psycopg.Error:
+            return None
+        value = row[0] if row else None
+        return value.year if isinstance(value, datetime) else None
 
     def _dispatch(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         ctx = self.ctx
@@ -516,8 +572,12 @@ class ToolRuntime:
             observation, handles, count = observe(tool, output, self.ledger)
             if tool == "flag_conflict":
                 observation["conflict"] = self.ledger.add_conflict(
-                    output["conflict_id"], str(args["description"])
+                    output["conflict_id"],
+                    str(args["description"]),
+                    stored=self.ctx.persist_conflicts,
                 )
+                if not self.ctx.persist_conflicts:
+                    observation["stored"] = False
             outcome.ok = True
             outcome.output = output
             outcome.observation = observation

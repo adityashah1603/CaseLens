@@ -325,3 +325,50 @@ def test_non_member_cannot_run_on_the_case(owner_conn: Conn, graph: Graph) -> No
         "SELECT count(*) FROM public.agent_runs WHERE case_id = %s", (graph.seeded.case_id,)
     ).fetchone()
     assert runs == (0,)
+
+
+def test_demo_user_conflicts_are_answered_but_never_stored(owner_conn: Conn, graph: Graph) -> None:
+    """openapi /ask: for the shared demo user (users.is_demo) flag_conflict writes nothing and
+    the answer's conflict_record_id is null; the conflict is still shown in the answer."""
+    conn = owner_conn
+    case_id, user_id = graph.seeded.case_id, graph.seeded.user_id
+    as_role(conn, None)
+    conn.execute("UPDATE public.users SET is_demo = true WHERE id = %s", (user_id,))
+    as_role(conn, "caselens_app", user_id)
+    chunk = evidence_result(
+        STATEMENT, page=2, chunk_id=graph.chunk_id, evidence_id=graph.seeded.evidence_id
+    )
+    chunk["locator"] = {
+        "kind": "pdf",
+        "page": 2,
+        "bbox": [72.0, 410.5, 540.0, 452.0],
+        "ocr_confidence": None,
+    }
+    model, fakes = _scripted(chunk)
+    result = ask(
+        conn,
+        conn,
+        case_id,
+        user_id,
+        "Who drove the gray sedan?",
+        router=model.router(),
+        backends=fakes.backends(),
+        config=AgentConfig(prefetch=False),
+    )
+    assert result.status == "succeeded" and not result.fell_back
+    assert [t.tool for t in result.tool_calls][-1] == "flag_conflict"
+    assert result.tool_calls[-1].ok and result.tool_calls[-1].conflict_id is None
+    assert result.answer["status"] == "answered"
+    shown = result.answer["conflicts"]
+    assert len(shown) == 1 and shown[0]["conflict_record_id"] is None
+    as_role(conn, None)
+    stored = conn.execute(
+        "SELECT count(*) FROM public.conflicts WHERE case_id = %s", (case_id,)
+    ).fetchone()
+    assert stored == (0,)
+    audit = conn.execute(
+        "SELECT payload FROM public.audit_log WHERE payload ->> 'run_id' = %s "
+        "AND action = 'agent.tool_call' AND payload ->> 'tool' = 'flag_conflict'",
+        (str(result.run_id),),
+    ).fetchone()
+    assert audit is not None and audit[0]["ok"] is True and audit[0]["conflict_id"] is None

@@ -33,6 +33,11 @@ class RetrievalSettings(BaseSettings):
     rerank_batch_size: int = Field(default=1, ge=1, le=256)
     rrf_k: int = Field(default=60, ge=1)
     hnsw_ef_search: int = Field(default=100, ge=1, le=1000)
+    # Record lane: structured-record rows matching the phones / plates / item tags / local time
+    # window a query names are added to the results (see `hints.py`). Wall-clock times in
+    # queries are read in this timezone (the same env var as the agent's).
+    record_lane: bool = True
+    case_timezone: str = "America/Los_Angeles"
 
 
 @lru_cache(maxsize=1)

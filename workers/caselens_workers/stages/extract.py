@@ -50,6 +50,7 @@ from caselens_workers.resolve import (
     add_mention,
     ensure_entity,
     link_similar_entities,
+    link_vehicle_plates,
     lock_case,
     merge_attributes,
     normalize_name,
@@ -417,6 +418,7 @@ def run_extract(ctx: StageContext, router: Callable[[], ModelRouter]) -> StageRe
         entity_ids = _write(ctx, out)
         adjudicator = _make_adjudicator(ctx.conn, llm_router if llm == "ok" else None, counts)
         links = link_similar_entities(ctx.conn, ctx.evidence.case_id, entity_ids, adjudicator)
+        plate_links = link_vehicle_plates(ctx.conn, ctx.evidence.case_id, entity_ids)
     review = sum(1 for _, conf in out.mentions.values() if conf < REVIEW_THRESHOLD)
     return StageResult(
         summary={
@@ -432,6 +434,7 @@ def run_extract(ctx: StageContext, router: Callable[[], ModelRouter]) -> StageRe
             "times_seen": times_seen,
             "links_fuzzy": links.fuzzy,
             "links_llm": links.llm,
+            "links_plate": plate_links,
             "adjudicated": links.adjudicated,
             "adjudication_skipped": links.adjudication_skipped,
         }

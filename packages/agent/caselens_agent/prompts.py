@@ -141,11 +141,22 @@ _ANSWER_FORMAT = """\
 _ANSWER_RULES = """\
 - Every claim cites at least one source handle (S1, S2, ...) that appears in the observations
   and actually supports it. Never invent handles. Leave out anything you cannot cite.
+- Cite EVERY observed source that states the claimed fact, not just one: a fact told by a
+  witness statement, a report and a recording gets all three handles. Prefer the most specific
+  source (the record row, the page or transcript segment that states it) over a summary.
+- Facts from records (calls, plate reads, custody entries) cite the record rows (the "ref" of
+  each query_records row). A count or list cites every row it counts or lists, one claim per
+  row or one claim citing all of them; a report that repeats the count may be cited too.
 - A quote, if given, must be copied character for character from the text shown for that
   source (a short span, under 25 words); otherwise null.
 - Contradictory sources go in conflicts[] side by side, each side cited; never resolve them
-  silently. Every conflict recorded with flag_conflict (F1, F2, ...) must appear in conflicts[]
-  with its "flag" handle. A contradiction you see but did not flag still goes in conflicts[]
+  silently. Check every answer for them: when sources disagree on a time, a vehicle (color,
+  make, plate), how many people were present or in a car, or an alibi / account of what
+  someone did, and it bears on the question, that is a conflict, even when the evidence
+  clearly favors one side (say which side the camera or record supports). A question asking
+  whether accounts agree, or whether evidence supports a statement, almost always has one.
+  Every conflict recorded with flag_conflict (F1, F2, ...) must appear in conflicts[] with its
+  "flag" handle. A contradiction you see but did not flag still goes in conflicts[]
   with "flag": null.
 - Give t_start / t_end for claims about when something happened, when a source states the time.
   Copy full timestamps (with their UTC offset) from observations; never invent an offset. If a
@@ -179,13 +190,28 @@ How to work: plan, act, observe, reflect. Each turn reply with ONE JSON object, 
   call returns nothing new.
 - Sources in observations carry short handles ("ref": "S1", "S2", ...). You cite handles only;
   never write ids or locators yourself.
-- Resolve names, plates and phone numbers with get_entity before querying records. Use
-  query_records for exact call / plate / custody questions (timestamps need a UTC offset, e.g.
-  2026-03-14T22:00:00-07:00), search_video for what cameras show, search_evidence for
-  statements, reports and transcripts.
-- When two sources contradict each other on something relevant (a time, a vehicle, a person),
-  call flag_conflict with both claims and their source handles before answering. Never pick a
-  side silently.
+- Records are the authority for calls, plate reads and custody. Any question that counts or
+  lists calls / texts / contact between phones, asks when someone called someone, where or when
+  a plate was read, which vehicles a camera read, or who handled an evidence item MUST be
+  answered from query_records rows, never from a report's summary of them:
+  * calls: calls_between (two phones; also call_count_between for "how many"),
+    calls_for_phone (one phone). Plates: plate_sightings (one plate), plate_sightings_near
+    (a camera location name fragment, e.g. "Marsh Rd"). Custody: custody_chain (item tag,
+    e.g. ITEM-001).
+  * Find the identifier first if the question names a person, vehicle or item instead: phone
+    numbers, plates and ITEM- tags appear in the observations (reports, carrier returns,
+    evidence-log rows, get_entity attributes). Use the number of each person's own phone.
+  * Use the exact window the question implies, with the case's UTC offset: "the week / seven
+    days before X" ends at X's time and starts 7 days earlier; "the evening of March 14" is
+    18:00 to 23:59:59 local. If the system already ran a record query with a wide window,
+    rerun it with the question's window when the question names a period.
+- Use search_video for what cameras show and search_evidence for statements, reports and
+  transcripts; get_entity resolves names, plates and phone numbers to their mentions.
+- When two sources contradict each other on something relevant (a time, a vehicle's color or
+  make, who or how many were present, an alibi), call flag_conflict with both claims and their
+  source handles before answering, then list it in conflicts[] with its flag handle. Never pick
+  a side silently. The observations may end with an automatic cross-check of values that differ
+  between sources; use it to spot contradictions, and verify each against the sources.
 
 The final answer object:
 """

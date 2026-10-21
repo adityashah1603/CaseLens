@@ -300,6 +300,148 @@ def _score_older_roots(
     return scored
 
 
+# ---- vehicle description -> plate ---------------------------------------------------------
+
+PLATE_LINK_CONFIDENCE = 0.9
+_PLATE_KEY = re.compile(r"^(?=.*\d)(?=.*[A-Z])[A-Z0-9]{4,8}$")
+_PLACEHOLDER_PLATES = frozenset({"unknown", "none", "na", "n a", "unk", "no plate", "not seen"})
+_COLOR_WORDS = re.compile(r"[a-z]+")
+_PLATE_TOKEN = re.compile(r"[A-Z0-9]+")
+
+
+def _plate_value(attributes: dict[str, Any]) -> str | None:
+    """The (possibly partial) plate attribute, normalized; None when absent or a placeholder."""
+    raw = attributes.get("plate")
+    if not isinstance(raw, str) or (normalize_name(raw) or "") in _PLACEHOLDER_PLATES:
+        return None
+    tokens = [t for t in _PLATE_TOKEN.findall(raw.upper()) if any(c.isdigit() for c in t)]
+    return tokens[0] if tokens else None
+
+
+def _words(value: Any) -> set[str]:
+    return set(_COLOR_WORDS.findall(str(value).casefold().replace("grey", "gray")))
+
+
+def plate_compatibility(desc: dict[str, Any], plate: str, plate_attrs: dict[str, Any]) -> bool:
+    """True when a descriptive vehicle (e.g. "gray Honda Civic") can be the vehicle with this
+    plate: its own plate, if any, agrees (equal, or a prefix of a partial read); no color /
+    make / model disagrees; and at least one of them positively agrees (so a bare "the car" is
+    never linked)."""
+    own = _plate_value(desc)
+    if own is not None and not plate.startswith(own):
+        return False
+    agree = own is not None and own == plate
+    for key in ("color", "make", "model"):
+        a, b = desc.get(key), plate_attrs.get(key)
+        if not a or not b:
+            continue
+        wa, wb = _words(a), _words(b)
+        if key == "color":
+            # "gray or silver" agrees with "gray"; "gray/silver" with "silver".
+            if not wa & wb:
+                return False
+        elif normalize_name(str(a)) != normalize_name(str(b)):
+            return False
+        agree = True
+    return agree
+
+
+def _root(conn: Conn, entity_id: uuid.UUID) -> uuid.UUID:
+    """Follow active outgoing links to the canonical entity (cycle-safe)."""
+    seen = {entity_id}
+    current = entity_id
+    while True:
+        row = conn.execute(
+            "SELECT to_entity_id FROM public.entity_links WHERE from_entity_id = %s "
+            "AND status = 'active' ORDER BY created_at, id LIMIT 1",
+            (current,),
+        ).fetchone()
+        if row is None or row[0] in seen:
+            return current
+        current = row[0]
+        seen.add(current)
+
+
+def _any_link(conn: Conn, a: uuid.UUID, b: uuid.UUID) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM public.entity_links WHERE (from_entity_id = %s AND to_entity_id = %s) "
+        "OR (from_entity_id = %s AND to_entity_id = %s) LIMIT 1",
+        (a, b, b, a),
+    ).fetchone()
+    return row is not None
+
+
+_PLATE_CANDIDATES = """
+SELECT DISTINCT p.id, p.normalized_key, p.attributes
+  FROM public.entities AS p
+ WHERE p.case_id = %(case_id)s AND p.type = 'vehicle' AND p.id <> %(entity_id)s
+   AND p.normalized_key IS NOT NULL AND p.normalized_key NOT LIKE 'desc:%%'
+   AND (p.normalized_key = %(own_plate)s
+        OR EXISTS (SELECT 1 FROM public.mentions AS md
+                     JOIN public.mentions AS mp
+                       ON mp.chunk_id = md.chunk_id AND mp.case_id = md.case_id
+                    WHERE md.case_id = %(case_id)s AND md.entity_id = %(entity_id)s
+                      AND mp.entity_id = p.id))
+ ORDER BY p.normalized_key
+"""
+
+
+def link_vehicle_plates(conn: Conn, case_id: uuid.UUID, entity_ids: Iterable[uuid.UUID]) -> int:
+    """Link descriptive vehicle entities ("gray Honda Civic", key `desc:...`) to the plate
+    entity ("SYN4821") they are mentioned with in the same chunk, or whose plate their own
+    `plate` attribute names, when the attributes are compatible (`plate_compatibility`) and
+    exactly one plate qualifies. The link joins the two canonical roots (description root ->
+    plate root, method 'fuzzy'); a pair with any existing link row, active or reverted, is never
+    linked again. Only INSERTs into entity_links. Returns the number of links made."""
+    lock_case(conn, case_id)
+    rows = conn.execute(
+        "SELECT id, attributes FROM public.entities WHERE case_id = %s AND id = ANY(%s) "
+        "AND type = 'vehicle' AND normalized_key LIKE 'desc:%%' ORDER BY created_at, id",
+        (case_id, list(set(entity_ids))),
+    ).fetchall()
+    made = 0
+    for entity_id, attributes in rows:
+        desc = dict(attributes or {})
+        own = _plate_value(desc)
+        candidates = conn.execute(
+            _PLATE_CANDIDATES,
+            {"case_id": case_id, "entity_id": entity_id, "own_plate": own or ""},
+        ).fetchall()
+        compatible = [
+            (pid, key)
+            for pid, key, pattrs in candidates
+            if _PLATE_KEY.match(str(key))
+            and plate_compatibility(desc, str(key), dict(pattrs or {}))
+        ]
+        exact = [c for c in compatible if own is not None and c[1] == own]
+        chosen = exact or compatible
+        if len({key for _, key in chosen}) != 1:
+            continue  # none, or two different plates: leave it to the analyst
+        src, dst = _root(conn, entity_id), _root(conn, chosen[0][0])
+        if src == dst or _any_link(conn, src, dst) or _any_link(conn, entity_id, chosen[0][0]):
+            continue
+        root_key = conn.execute(
+            "SELECT normalized_key FROM public.entities WHERE id = %s", (src,)
+        ).fetchone()
+        if root_key is not None and not str(root_key[0] or "desc:").startswith("desc:"):
+            continue  # the description already resolves to a plate: never merge two plates
+        _insert_link(conn, case_id, src, dst, "fuzzy", PLATE_LINK_CONFIDENCE)
+        made += 1
+    return made
+
+
+def relink_vehicles(conn: Conn, case_id: uuid.UUID) -> int:
+    """Run `link_vehicle_plates` over every descriptive vehicle entity of the case, from the
+    existing entities and mentions only: no re-extraction, no model call. Insert-only and
+    idempotent (a second run links nothing). Call inside a transaction; returns links made."""
+    rows = conn.execute(
+        "SELECT id FROM public.entities WHERE case_id = %s AND type = 'vehicle' "
+        "AND normalized_key LIKE 'desc:%%'",
+        (case_id,),
+    ).fetchall()
+    return link_vehicle_plates(conn, case_id, [r[0] for r in rows])
+
+
 def _insert_link(
     conn: Conn,
     case_id: uuid.UUID,

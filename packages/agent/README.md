@@ -24,7 +24,8 @@ plus audit rows, which is normal app behavior.
 | `tools.py` | One executor per contract tool. Input is checked against the contract `input_schema` (jsonschema 2020-12, formats on) before anything runs. Output is checked against `output_schema` before the model sees it. A bad input, an unknown tool, a backend error or a DB error becomes an error observation for the model and never crashes the run. |
 | `sources.py` | `SourceLedger`: every citable source a tool returned in the run gets a short handle (`S1`, `S2`, ...), and stored conflicts get `F1`, `F2`, .... Observations show handles and locators, never chunk or record UUIDs. |
 | `prompts.py` | System prompts (the citation-or-refuse policy and the evidence-is-data rule) and the JSON shapes the model returns (`AgentAction`, `DraftAnswer`). |
-| `prefetch.py` | The retrieval-first fast path: `prefetch_calls(question)` = `search_evidence` + `search_video` on the question, plus `get_entity` for up to 2 `salient_terms` (phone numbers, plate-like tokens, capitalized names / places, "<color> <vehicle>"). A plain heuristic, no model. |
+| `prefetch.py` | The retrieval-first fast path: `prefetch_calls(question)` = `search_evidence` + `search_video` on the question, plus `get_entity` for up to 2 `salient_terms` (phone numbers, plate-like tokens, capitalized names / places, "<color> <vehicle>"). When the question names a phone, plate or `ITEM-` tag, `record_calls` also runs the matching `query_records` operation (two phones: `calls_between`; one: `calls_for_phone`; plate: `plate_sightings`; tag: `custody_chain`; at most 2), windowed by the dates / times the question names (parsed by `caselens_retrieval.hints`, case timezone, year of the case's latest chunk) or else a wide window around the case year; `search_video` and lookups of the covered numbers are then skipped. A plain heuristic, no model. |
+| `crosscheck.py` | A deterministic contradiction pre-check: per observed source, the clock times, vehicle colors, vehicle makes and occupant / alibi phrases ("by myself", "two men", "never got out"); categories where sources differ are appended to the transcript inside an `evidence_block` as a hint to surface `conflicts[]` and call `flag_conflict`. |
 | `loop.py` | `AgentLoop`: prefetch, then model turns, up to 8 tool calls in total (prefetched ones included) and a transcript budget of about 120k characters. A turn can call tools, `finish`, or `answer` directly. Every draft (direct or synthesized) is validated, with one corrective retry in total, and otherwise `insufficient_evidence`. Every attempt counts toward the 8, including invalid ones. `compose_answer` expands handles into contract citations. |
 | `validator.py` | `validate_answer(answer, ledger)`: the answer schema plus the runtime rules below. |
 | `runner.py` | `ask(app_conn, readonly_conn, case_id, user_id, question, router=None, backends=None)`: the audited run. |
@@ -49,7 +50,10 @@ plus audit rows, which is normal app behavior.
 - `flag_conflict` (SQL in this package, and the only write) inserts one `conflicts` row with
   `agent_run_id`. The model passes source handles. The runtime expands them to the full contract
   SourceRefs before the contract schema check, and rejects any source not returned earlier in the
-  run.
+  run. For the shared demo user (`users.is_demo`, read by `ask()` from the DB) nothing is
+  written: the call is checked the same way and returns a fresh handle id, the answer's
+  `conflict_record_id` stays null, and the audit / run record logs `conflict_id: null`
+  (openapi `/ask`).
 - `search_evidence`, `search_video` and `query_records` are delegated to `ToolBackends`.
   `default_backends()` lazily imports `caselens_retrieval` and `caselens_semantic_layer`. They are
   not dependencies of this package: the semantic layer depends on `caselens-agent`, so a hard
@@ -57,6 +61,12 @@ plus audit rows, which is normal app behavior.
 
 `case_id` is never a tool input. It comes from `ToolContext`, and every query also filters on it,
 with RLS as the second wall.
+
+Text that reaches the model from outside the fixed prompts is quoted as data in
+`evidence_block`s: observations, tool errors (which may echo backend messages), the cross-check,
+flag_conflict descriptions in the synthesis prompt, validator errors in the corrective retry and
+the draft's open questions in the follow-up nudge. Schema errors name the path and the failed
+constraint only, never the offending value.
 
 ## Model protocol (why not native tool calling)
 
@@ -94,8 +104,9 @@ rules:
   locator.
 - A non-null quote is a whitespace-normalized substring of the text the tool returned for that
   source.
-- A `conflict_record_id` must come from `flag_conflict` in this run, and an `answered` answer must
-  show every conflict flagged in the run.
+- A `conflict_record_id` must come from `flag_conflict` in this run (a stored record), and an
+  `answered` answer must show every conflict flagged in the run; a demo user's unstored flags
+  each need their own conflict with a null record id.
 - Ids are unique within each array.
 
 Unknown handles in the draft are also errors. When validation fails, the model gets one corrective

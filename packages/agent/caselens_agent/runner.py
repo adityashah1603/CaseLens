@@ -146,7 +146,16 @@ def ask(
                 },
             )
 
-    ctx = ToolContext(app_conn, readonly_conn, case_id, agent_run_id=run_id)
+    # The shared demo user never stores conflicts (openapi /ask): flag_conflict returns a handle
+    # only and the answer's conflict_record_id stays null. Read from the DB, not the caller.
+    with app_conn.transaction():
+        demo_row = app_conn.execute(
+            "SELECT is_demo FROM public.users WHERE id = %s", (user_id,)
+        ).fetchone()
+    is_demo = demo_row is None or bool(demo_row[0])
+    ctx = ToolContext(
+        app_conn, readonly_conn, case_id, agent_run_id=run_id, persist_conflicts=not is_demo
+    )
     loop = AgentLoop(router, ToolRuntime(ctx, backends), config, on_tool_call=on_tool_call)
     try:
         result: LoopResult = loop.run(question)

@@ -419,3 +419,34 @@ def test_bad_arguments_are_rejected(owner_conn: Conn, case: Case) -> None:
         run(owner_conn, case, "gray", top_k=0)
     with pytest.raises(ValueError, match="query"):
         run(owner_conn, case, "   ")
+
+
+@pytest.mark.db
+def test_record_lane_reserves_rows_for_named_plates_and_windows(
+    owner_conn: Conn, case: Case
+) -> None:
+    def prefer_prose(query: str, docs: Sequence[str]) -> list[float]:
+        return [0.0 if "Plate read row" in d else 1.0 for d in docs]
+
+    def top(query: str, k: int, filters: EvidenceFilters | None = None) -> list[uuid.UUID]:
+        out = search_evidence(
+            owner_conn,
+            case.case_id,
+            query,
+            filters,
+            top_k=k,
+            embedder=fake_embed,
+            reranker=prefer_prose,
+        )
+        return [r.chunk_id for r in out.results]
+
+    row = case.chunks["csv_row"]
+    # The reranker ranks the plate row last, but a named plate reserves it a slot.
+    assert top("the gray sedan at the lot", 1) != [row]
+    assert top("plate SYN0001 at the lot", 1) == [row]
+    # A time window (case-local, the year taken from the case's chunks) with a plate-read
+    # question finds the row too; a window that misses it does not.
+    assert top("which plates did the camera read between 3:40 and 3:45 PM on March 14", 1) == [row]
+    assert row not in top("which plates did the camera read on March 20", 1)
+    # Filters still apply: no csv modality, no lane.
+    assert row not in top("plate SYN0001", 2, EvidenceFilters(modalities=["pdf"]))

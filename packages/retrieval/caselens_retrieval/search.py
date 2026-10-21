@@ -1,5 +1,13 @@
 """Hybrid search: pgvector cosine + Postgres full-text, fused with RRF, then cross-encoder rerank.
 
+A third, structured "record lane" (`_record_lane`) adds the record-row chunks (call detail rows,
+plate reads, evidence-log rows) that match the phones, plates, item tags and local time window a
+query names (`hints.py`), plus the plates of vehicles the query describes by name (from the
+case's vehicle entities). Those rows rank poorly by meaning, so when the query names an
+identifier, or a time window together with calls or plate reads, they get reserved result slots
+(fewer for a vehicle known only by description); evidence-log rows for a custody question only
+join the rerank pool.
+
 The connection must already run as `caselens_app` with `app.user_id` set, so RLS applies on top
 of the explicit, bound `case_id` predicate. All values are bound parameters; the only composed
 SQL is fixed fragments from this module (`psycopg.sql.SQL` literals).
@@ -12,8 +20,9 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg import sql
@@ -24,6 +33,17 @@ from caselens_retrieval.encoders import (
     Reranker,
     default_embedder,
     default_reranker,
+)
+from caselens_retrieval.hints import (
+    CALL_TABLE,
+    CUSTODY_TABLE,
+    PLATE_TABLE,
+    QueryHints,
+    find_plates,
+    owner_named_in,
+    parse_hints,
+    plate_of,
+    vehicle_names_in,
 )
 from caselens_retrieval.models import (
     LOCATOR_ADAPTER,
@@ -202,6 +222,164 @@ def _candidate(row: tuple[Any, ...]) -> Candidate:
     )
 
 
+@dataclass(frozen=True)
+class RecordLane:
+    """Record-row candidates for a query and how many result slots they may reserve.
+
+    * "exact": the query names a phone / plate / item tag, or a time window with calls or
+      plate reads: up to `lane_slots(top_k)` slots.
+    * "described": plate reads of a vehicle the query describes ("where did the gray Civic
+      go"): up to `described_slots(top_k)` slots.
+    * "pool": evidence-log rows for a custody question: they only join the rerank pool.
+    """
+
+    hits: list[Candidate]
+    mode: Literal["exact", "described", "pool"]
+    hints: QueryHints
+
+    def slots(self, top_k: int) -> int:
+        if self.mode == "exact":
+            return lane_slots(top_k)
+        if self.mode == "described":
+            return described_slots(top_k)
+        return 0
+
+
+_CASE_LATEST = "SELECT max(t_start) FROM public.chunks WHERE case_id = %(case_id)s"
+_VEHICLES = (
+    "SELECT canonical_name, normalized_key, attributes FROM public.entities "
+    "WHERE case_id = %(case_id)s AND type = 'vehicle'"
+)
+_NON_ALNUM = re.compile(r"[^A-Z0-9]")
+
+
+def _case_timezone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def _vehicle_plates(conn: Conn, case_id: uuid.UUID, query: str) -> tuple[list[str], list[str]]:
+    """(plates of vehicles the query names by description, e.g. "the gray Civic"; full plates
+    of plate-like tokens in the query resolved through entity aliases, e.g. a misread SYN482I)."""
+    tokens = set(find_plates(query))
+    derived: list[str] = []
+    resolved: list[str] = []
+    for name, key, attributes in conn.execute(_VEHICLES, {"case_id": case_id}).fetchall():
+        attrs: dict[str, Any] = attributes if isinstance(attributes, dict) else {}
+        plate = plate_of(attrs, key)
+        if plate is None:
+            continue
+        raw_aliases = attrs.get("aliases")
+        aliases = [str(a) for a in raw_aliases] if isinstance(raw_aliases, list) else []
+        names = [str(name), *aliases]
+        keys = {_NON_ALNUM.sub("", n.upper()) for n in [*names, str(key or "")]}
+        if tokens & keys:
+            resolved.append(plate)
+        elif vehicle_names_in(query, names) or owner_named_in(
+            query, str(attrs.get("description") or "")
+        ):
+            derived.append(plate)
+    return list(dict.fromkeys(derived)), list(dict.fromkeys(resolved))
+
+
+def _like(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _record_lane(
+    conn: Conn,
+    case_id: uuid.UUID,
+    query: str,
+    fts_query: str,
+    filters: EvidenceFilters | None,
+    settings: RetrievalSettings,
+) -> RecordLane | None:
+    """Record-row chunks matching the query's structured hints (inside the caller's
+    transaction). None when the query has no usable hint."""
+    if filters is not None and filters.modalities and "csv" not in filters.modalities:
+        return None
+    row = conn.execute(_CASE_LATEST, {"case_id": case_id}).fetchone()
+    latest = row[0] if row else None
+    year = latest.year if isinstance(latest, datetime) else datetime.now(UTC).year
+    derived, resolved = _vehicle_plates(conn, case_id, query)
+    hints = parse_hints(
+        query, _case_timezone(settings.case_timezone), year, derived_plates=tuple(derived)
+    )
+    # A described vehicle narrows plate reads, not e.g. the evidence log of a search.
+    use_derived = PLATE_TABLE in hints.tables or not hints.tables
+    plates = list(dict.fromkeys([*hints.plates, *resolved, *(derived if use_derived else [])]))
+    timed_tables = {CALL_TABLE, PLATE_TABLE} & set(hints.tables)
+    mode: Literal["exact", "described", "pool"]
+    if hints.has_identifiers or (hints.window and timed_tables):
+        mode = "exact"
+    elif derived and PLATE_TABLE in hints.tables:
+        # A vehicle known only by description: its plate reads compete in the rerank pool
+        # instead of taking reserved slots (reserving them crowded out narrative evidence).
+        mode = "pool"
+    elif CUSTODY_TABLE in hints.tables:
+        mode = "pool"
+    else:
+        return None
+
+    clauses, params = _filter_clauses(case_id, filters)
+    clauses.append(sql.SQL("c.modality = 'csv'"))
+    if hints.tables:
+        clauses.append(sql.SQL("c.locator ->> 'table' = ANY(%(lane_tables)s::text[])"))
+        params["lane_tables"] = list(hints.tables)
+    if hints.phones:
+        clauses.append(sql.SQL("c.text ILIKE ALL(%(lane_all)s::text[])"))
+        params["lane_all"] = [_like(p) for p in hints.phones]
+    any_of = [*plates, *hints.item_ids]
+    if any_of:
+        clauses.append(sql.SQL("c.text ILIKE ANY(%(lane_any)s::text[])"))
+        params["lane_any"] = [_like(v) for v in any_of]
+    if hints.window is not None and (hints.phones or timed_tables or plates):
+        # Custody rows are dated by collection and their chain runs for days: no window.
+        clauses.append(
+            sql.SQL(
+                "(c.locator ->> 'table' = %(lane_custody)s OR (c.t_start >= %(lane_from)s "
+                "AND c.t_start <= %(lane_to)s))"
+            )
+        )
+        params.update(
+            lane_custody=CUSTODY_TABLE, lane_from=hints.window[0], lane_to=hints.window[1]
+        )
+    params["lane_fts"] = fts_query
+    params["lane_n"] = settings.retrieval_candidates
+    stmt = sql.SQL(
+        "SELECT {cols} FROM public.chunks c WHERE {where} "
+        "ORDER BY ts_rank_cd(c.tsv, websearch_to_tsquery('english', %(lane_fts)s)) DESC, "
+        "c.t_start NULLS LAST, c.id LIMIT %(lane_n)s"
+    ).format(cols=_COLUMNS, where=sql.SQL(" AND ").join(clauses))
+    hits = [_candidate(r) for r in conn.execute(stmt, params).fetchall()]
+    return RecordLane(hits, mode, hints) if hits else None
+
+
+def lane_slots(top_k: int) -> int:
+    """Result slots an exact record lane may take; the rest stay for the ranked results."""
+    return max(top_k - max(2, top_k // 3), 1)
+
+
+def described_slots(top_k: int) -> int:
+    """Result slots for plate reads of a vehicle known only by its description."""
+    return max((top_k + 1) // 2 - 1, 1)
+
+
+def _with_reserved(
+    ranked: Sequence[tuple[Candidate, float]], reserved: Sequence[uuid.UUID], top_k: int
+) -> list[Scored]:
+    """The best `top_k` of `ranked`, always including the `reserved` ids, in ranked order."""
+    keep = set(reserved)
+    for c, _ in ranked:
+        if len(keep) >= top_k:
+            break
+        keep.add(c.chunk_id)
+    return [Scored(c, score) for c, score in ranked if c.chunk_id in keep][:top_k]
+
+
 def _retrieve(
     conn: Conn,
     case_id: uuid.UUID,
@@ -209,7 +387,8 @@ def _retrieve(
     fts_query: str,
     filters: EvidenceFilters | None,
     settings: RetrievalSettings,
-) -> tuple[list[Candidate], list[Candidate]]:
+    query: str = "",
+) -> tuple[list[Candidate], list[Candidate], RecordLane | None]:
     clauses, params = _filter_clauses(case_id, filters)
     where = sql.SQL(" AND ").join(clauses)
     params["n"] = settings.retrieval_candidates
@@ -240,7 +419,12 @@ def _retrieve(
             ).format(cols=_COLUMNS, where=where)
             rows = conn.execute(stmt, {**params, "fts": fts_query}).fetchall()
             text_hits = [_candidate(r) for r in rows]
-    return vector_hits, text_hits
+        lane = (
+            _record_lane(conn, case_id, query, fts_query, filters, settings)
+            if settings.record_lane and query
+            else None
+        )
+    return vector_hits, text_hits, lane
 
 
 def hybrid_search(
@@ -269,23 +453,34 @@ def hybrid_search(
     if len(query_vec) != EMBEDDING_DIM:
         raise ValueError(f"query embedding has {len(query_vec)} dims, expected {EMBEDDING_DIM}")
     t1 = time.perf_counter()
-    vector_hits, text_hits = _retrieve(conn, case_id, query_vec, fts_or_query(query), filters, s)
+    vector_hits, text_hits, lane = _retrieve(
+        conn, case_id, query_vec, fts_or_query(query), filters, s, query
+    )
     t2 = time.perf_counter()
 
-    by_id = {c.chunk_id: c for c in (*vector_hits, *text_hits)}
-    fused = rrf_fuse(
-        [[c.chunk_id for c in vector_hits], [c.chunk_id for c in text_hits]], k=s.rrf_k
-    )
+    lane_hits = lane.hits if lane is not None else []
+    by_id = {c.chunk_id: c for c in (*vector_hits, *text_hits, *lane_hits)}
+    lists = [[c.chunk_id for c in vector_hits], [c.chunk_id for c in text_hits]]
+    if lane_hits:
+        lists.append([c.chunk_id for c in lane_hits])
+    fused = rrf_fuse(lists, k=s.rrf_k)
+    lane_ids = [c.chunk_id for c in lane_hits[: s.rerank_candidates]]
+    reserved = lane.slots(top_k) if lane is not None else 0
     ranker = (reranker or default_reranker()) if rerank else None
     if ranker is None or not fused:
-        results = [Scored(by_id[cid], score) for cid, score in fused[:top_k]]
+        ranked = [(by_id[cid], score) for cid, score in fused]
+        lane_order = lane_ids
     else:
-        pool = [by_id[cid] for cid, _ in fused[: s.rerank_candidates]]
+        head = [cid for cid, _ in fused[: s.rerank_candidates]]
+        pool = [by_id[cid] for cid in dict.fromkeys([*head, *lane_ids])]
         scores = ranker(query, [rerank_snippet(query, c.text, s.rerank_window_words) for c in pool])
         if len(scores) != len(pool):
             raise ValueError("reranker returned the wrong number of scores")
         order = sorted(range(len(pool)), key=lambda i: (-scores[i], i))
-        results = [Scored(pool[i], float(scores[i])) for i in order[:top_k]]
+        ranked = [(pool[i], float(scores[i])) for i in order]
+        in_lane = set(lane_ids)
+        lane_order = [c.chunk_id for c, _ in ranked if c.chunk_id in in_lane]
+    results = _with_reserved(ranked, lane_order[:reserved], top_k)
     t3 = time.perf_counter()
 
     t.embed_ms = (t1 - t0) * 1000

@@ -92,6 +92,7 @@ class FlaggedConflict:
     handle: str
     conflict_id: str
     description: str
+    stored: bool = True  # False: a demo-user handle, nothing was written
 
 
 class SourceLedger:
@@ -113,9 +114,9 @@ class SourceLedger:
             self._by_handle[handle].texts.append(text)
         return handle
 
-    def add_conflict(self, conflict_id: str, description: str) -> str:
+    def add_conflict(self, conflict_id: str, description: str, stored: bool = True) -> str:
         handle = f"F{len(self.flagged) + 1}"
-        self.flagged[handle] = FlaggedConflict(handle, conflict_id, description)
+        self.flagged[handle] = FlaggedConflict(handle, conflict_id, description, stored)
         return handle
 
     def get(self, handle: str) -> ObservedSource | None:
@@ -128,8 +129,12 @@ class SourceLedger:
     def handles(self) -> list[str]:
         return list(self._by_handle)
 
+    def sources(self) -> list[ObservedSource]:
+        return list(self._by_handle.values())
+
     def flagged_ids(self) -> set[str]:
-        return {f.conflict_id for f in self.flagged.values()}
+        """Ids of conflict records stored in this run (unstored demo handles excluded)."""
+        return {f.conflict_id for f in self.flagged.values() if f.stored}
 
     def __len__(self) -> int:
         return len(self._by_handle)

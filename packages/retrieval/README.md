@@ -50,6 +50,22 @@ out.model_dump(mode="json")  # validates against the tool's output_schema
    chosen by query-term overlap: the cross-encoder truncates at 512 tokens and its cost grows with
    length. Final `score` = reranker logit (RRF score when reranking is off).
 
+5. Record lane (`hints.py`, `_record_lane`; `CASELENS_RECORD_LANE=false` turns it off). Record
+   rows ("Plate read row 250: plate SYN4821 (CA) read at 2026-03-14 22:24:37-07:00 ...") rank
+   poorly by meaning against a question, so a third candidate list pulls the csv chunks that
+   match the query's structured hints: phone numbers (all must appear), plates and `ITEM-` tags
+   (any), plates of vehicles the query describes by an entity name or alias ("the gray Civic")
+   or by owner ("Darnell's", from "registered to ..." descriptions), the record tables its words
+   imply (calls / plate reads / custody), and a local time window ("between 10 and 11 PM on
+   March 14", "the evening of March 14", "from 9 PM on March 14 to 2 AM on March 15"; dates
+   without a year take the year of the case's latest timed chunk, times are read in
+   `CASELENS_CASE_TIMEZONE`). Lane rows are reranked with the rest and then:
+   - **exact** (a phone / plate / item tag, or a window with a call or plate-read question):
+     up to `top_k - max(2, top_k // 3)` reserved result slots (7 of 10, 6 of 8);
+   - **described** (plate reads of a vehicle named only by description, in a movement
+     question): up to `(top_k + 1) // 2 - 1` slots (4 of 10, 3 of 8);
+   - **pool** (an evidence-log / custody question without a tag): rerank pool only.
+
 Filters: `modalities`, `evidence_ids`; `entity_ids` keeps chunks with a mention of those
 entities or of any entity joined to them by active `entity_links` (both directions, transitive);
 `time_from` / `time_to` keep timed chunks whose `[t_start, t_end]` overlaps the window and
@@ -73,6 +89,8 @@ with the time window as a hard filter. `track_id`, `start_ms`, `end_ms` and keyf
 | `CASELENS_RERANK_CANDIDATES` | `30` | fused candidates sent to the reranker |
 | `CASELENS_RERANK_WINDOW_WORDS` | `48` | rerank window for long chunks (0 = full text) |
 | `CASELENS_RERANK_BATCH_SIZE` | `1` | cross-encoder batch (1 is fastest on CPU: no padding) |
+| `CASELENS_RECORD_LANE` | `true` | the structured record lane (step 5) |
+| `CASELENS_CASE_TIMEZONE` | `America/Los_Angeles` | how wall-clock times in queries are read |
 
 ## Quality on the demo case
 
