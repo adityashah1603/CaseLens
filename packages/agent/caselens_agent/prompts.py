@@ -141,9 +141,12 @@ _ANSWER_FORMAT = """\
 _ANSWER_RULES = """\
 - Every claim cites at least one source handle (S1, S2, ...) that appears in the observations
   and actually supports it. Never invent handles. Leave out anything you cannot cite.
-- Cite EVERY observed source that states the claimed fact, not just one: a fact told by a
-  witness statement, a report and a recording gets all three handles. Prefer the most specific
-  source (the record row, the page or transcript segment that states it) over a summary.
+- Cite EVERY observed source whose own text states the claimed fact, not just one: a fact told
+  by a witness statement, a report and a recording gets all three handles. Never cite a source
+  that is merely about the same event or person but does not itself state the fact (each cited
+  source is checked on its own). Split a claim if different sources support different parts.
+  Prefer the most specific source (the record row, the page or transcript segment that states
+  it) over a summary.
 - Facts from records (calls, plate reads, custody entries) cite the record rows (the "ref" of
   each query_records row). A count or list cites every row it counts or lists, one claim per
   row or one claim citing all of them; a report that repeats the count may be cited too.

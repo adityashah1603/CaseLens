@@ -144,8 +144,85 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
+_WORD = re.compile(r"[a-z0-9']{3,}")
+_STOP = frozenset(
+    {
+        "the",
+        "and",
+        "was",
+        "were",
+        "what",
+        "who",
+        "when",
+        "where",
+        "which",
+        "with",
+        "from",
+        "that",
+        "this",
+        "did",
+        "does",
+        "for",
+        "are",
+        "how",
+        "his",
+        "her",
+        "their",
+        "they",
+        "them",
+        "there",
+        "into",
+        "about",
+        "after",
+        "before",
+        "between",
+        "say",
+        "said",
+        "",
+    }
+)
+
+
+def focus(text: str, query: str | None, limit: int) -> str:
+    """The `limit`-char window of `text` that best matches the query terms.
+
+    Long chunks (a whole PDF page) start with headers and boilerplate, so clipping the head hid
+    the passage the search matched. The full text stays in the ledger for quote checks.
+    """
+    if len(text) <= limit or not query:
+        return _clip(text, limit)
+    # Stems (first 4 letters) so "hear" matches "heard"; each term is weighted by its rarity in
+    # this text, so a name repeated in every header counts less than the words of the passage.
+    stems = {w[:4] for w in _WORD.findall(query.casefold()) if w not in _STOP}
+    if not stems:
+        return _clip(text, limit)
+    hits = [(m.start(), m.group()[:4]) for m in _WORD.finditer(text.casefold())]
+    hits = [(pos, stem) for pos, stem in hits if stem in stems]
+    if not hits:
+        return _clip(text, limit)
+    counts: dict[str, int] = {}
+    for _, stem in hits:
+        counts[stem] = counts.get(stem, 0) + 1
+    best_start, best_score = 0, -1.0
+    for anchor, _ in hits:
+        for lead in (limit // 10, limit // 4, limit // 2, (3 * limit) // 4):
+            start = max(0, min(anchor - lead, len(text) - limit))
+            present = {stem for pos, stem in hits if start <= pos < start + limit - 40}
+            score = sum(1.0 / counts[stem] for stem in present)
+            if score > best_score:
+                best_start, best_score = start, score
+    window = text[best_start : best_start + limit - 6].strip()
+    prefix = "..." if best_start > 0 else ""
+    suffix = "..." if best_start + limit - 6 < len(text) else ""
+    return f"{prefix}{window}{suffix}"
+
+
 def observe(
-    tool: str, output: dict[str, Any], ledger: SourceLedger, text_limit: int = 600
+    tool: str,
+    output: dict[str, Any],
+    ledger: SourceLedger,
+    text_limit: int = 700,
+    query: str | None = None,
 ) -> tuple[dict[str, Any], list[str], int]:
     """Register the sources in a validated tool output.
 
@@ -170,7 +247,7 @@ def observe(
                     "modality": r["modality"],
                     "score": round(float(r["score"]), 4),
                     "locator": r["locator"],
-                    "text": _clip(r["text"], text_limit),
+                    "text": focus(r["text"], query, text_limit),
                 }
             )
         return {"results": items}, handles, len(items)
@@ -183,7 +260,7 @@ def observe(
                 {
                     "ref": h,
                     "track_id": r["track_id"],
-                    "summary": _clip(r["summary"], text_limit),
+                    "summary": focus(r["summary"], query, text_limit),
                     "start_ms": r["start_ms"],
                     "end_ms": r["end_ms"],
                     "wall_clock_start": r["wall_clock_start"],

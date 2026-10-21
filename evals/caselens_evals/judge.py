@@ -12,9 +12,13 @@ Refusals with no claims are scored without a call (nothing to judge).
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict
 
@@ -79,6 +83,21 @@ class JudgeResult(BaseModel):
         return self.output is not None
 
 
+_UTC_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:\+00:00|Z)")
+
+
+def localize_times(text: str, tz: str | None = None) -> str:
+    """Rewrite UTC timestamps (as record rows store them) in the case's local time, so the judge
+    does not misplace a 21:58 local call on the next UTC day."""
+    zone = ZoneInfo(tz or os.environ.get("CASELENS_CASE_TIMEZONE") or "America/Los_Angeles")
+
+    def repl(m: re.Match[str]) -> str:
+        when = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}+00:00").astimezone(zone)
+        return when.isoformat(timespec="seconds") + " (local)"
+
+    return _UTC_TS.sub(repl, text)
+
+
 def _locator_text(loc: Mapping[str, Any]) -> str:
     return json.dumps({k: v for k, v in loc.items() if v is not None}, sort_keys=True)
 
@@ -121,7 +140,8 @@ def build_prompt(item: GoldItem, run: RunRecord) -> str:
         body = ""
         if cit.get("quote"):
             body += f"quote: {cit['quote']}\n"
-        body += f"source text: {src.text if src and src.text else '(not available)'}"
+        text = localize_times(src.text) if src and src.text else "(not available)"
+        body += f"source text: {text}"
         parts.append(evidence_block(label, body))
     return "\n\n".join(parts)
 

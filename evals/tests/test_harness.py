@@ -417,3 +417,10 @@ def test_smoke_skips_without_live_environment(
     assert cli.main(["smoke", "--gold", str(tmp_path / "missing.jsonl")]) == 0
     monkeypatch.setenv("CASELENS_EVAL_REQUIRE_LIVE", "1")
     assert cli.main(["smoke", "--gold", str(FIXTURE)]) == 2
+
+
+def test_judge_sees_record_times_in_case_local_time() -> None:
+    from caselens_evals.judge import localize_times
+
+    row = '{"started_at": "2026-03-15T05:58:02+00:00", "row_id": 466}'
+    assert "2026-03-14T22:58:02-07:00 (local)" in localize_times(row, "America/Los_Angeles")

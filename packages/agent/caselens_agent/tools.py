@@ -569,7 +569,10 @@ class ToolRuntime:
             errors = output_errors(tool, output)
             if errors:
                 raise ToolError("tool output failed contract validation")
-            observation, handles, count = observe(tool, output, self.ledger)
+            query = args.get("query") if isinstance(args, dict) else None
+            observation, handles, count = observe(
+                tool, output, self.ledger, query=query if isinstance(query, str) else None
+            )
             if tool == "flag_conflict":
                 observation["conflict"] = self.ledger.add_conflict(
                     output["conflict_id"],
