@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, get_args
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 from caselens_api import models as m
 from caselens_api.common import (
@@ -18,7 +18,7 @@ from caselens_api.common import (
     parse_id,
 )
 from caselens_api.db import Conn
-from caselens_api.deps import ViewerCase
+from caselens_api.deps import CaseSession, ViewerCase, client_ip
 from caselens_api.problems import ProblemError, not_found, validation
 
 router = APIRouter(prefix="/v1/cases/{case_id}")
@@ -33,7 +33,14 @@ SELECT r.id, r.case_id, r.user_id, r.question, r.status, r.model, r.plan, r.tool
   FROM public.agent_runs AS r
  WHERE r.case_id = %(case_id)s
 """
-_RUN_ONE = _RUN_SELECT + " AND r.id = %(run_id)s"
+# Demo users (is_demo) see only their own runs: only_user is their id, NULL for everyone else.
+_RUN_ONE = (
+    _RUN_SELECT
+    + """
+   AND r.id = %(run_id)s
+   AND (%(only_user)s::uuid IS NULL OR r.user_id = %(only_user)s::uuid)
+"""
+)
 _RUN_AFTER_FAILURE = (
     _RUN_SELECT
     + """
@@ -47,6 +54,7 @@ SELECT r.id, r.user_id, r.question, r.status, r.answer ->> 'status', r.model, r.
        r.cost_usd, r.created_at
   FROM public.agent_runs AS r
  WHERE r.case_id = %(case_id)s
+   AND (%(only_user)s::uuid IS NULL OR r.user_id = %(only_user)s::uuid)
    AND (%(c_ts)s::timestamptz IS NULL OR (r.created_at, r.id) < (%(c_ts)s, %(c_id)s::uuid))
  ORDER BY r.created_at DESC, r.id DESC
  LIMIT %(limit)s
@@ -111,28 +119,61 @@ def run_from_row(row: tuple[Any, ...]) -> m.AgentRun:
     )
 
 
-def load_run(conn: Conn, case_id: uuid.UUID, run_id: uuid.UUID) -> m.AgentRun:
-    row = conn.execute(_RUN_ONE, {"case_id": case_id, "run_id": run_id}).fetchone()
+def own_runs_only(case: CaseSession) -> uuid.UUID | None:
+    """The shared demo login sees only its own runs, so visitors never see each other's
+    questions; every other member sees all runs in the case."""
+    return case.user.id if case.user.is_demo else None
+
+
+def load_run(
+    conn: Conn, case_id: uuid.UUID, run_id: uuid.UUID, only_user: uuid.UUID | None = None
+) -> m.AgentRun:
+    row = conn.execute(
+        _RUN_ONE, {"case_id": case_id, "run_id": run_id, "only_user": only_user}
+    ).fetchone()
     if row is None:
         raise not_found("No such run.")
     return run_from_row(row)
 
 
 @router.post("/ask", response_model=m.AgentRun)
-def ask_question(body: m.AskRequest, case: ViewerCase) -> m.AgentRun:
-    from caselens_agent.runner import CaseAccessError, ask
-
+def ask_question(body: m.AskRequest, case: ViewerCase, request: Request) -> m.AgentRun:
     services = case.services
     question = body.question.strip()
     if not question:
         raise validation("question must not be blank.", ["body", "question"])
-    wait = services.ask_limiter.check(case.user.id)
-    if wait is not None:
+    settings = services.settings
+    # Each run holds this request's connection and a read-only one for its whole duration, so
+    # concurrent runs are bounded well below the pool size; over the bound -> 429, not a wait.
+    if not services.ask_slots.acquire(blocking=False):
         raise ProblemError(
             429,
-            "Too many questions; wait before asking again.",
-            headers={"Retry-After": str(wait)},
+            "The investigator is busy with other questions; try again shortly.",
+            headers={"Retry-After": str(settings.ask_busy_retry_after_s)},
         )
+    try:
+        # The shared demo login is limited per client address, not per (shared) user id.
+        key: tuple[str, str | uuid.UUID] = (
+            ("ip", client_ip(request, settings.trusted_proxy_hops))
+            if case.user.is_demo
+            else ("user", case.user.id)
+        )
+        wait = services.ask_limiter.check(key)
+        if wait is not None:
+            raise ProblemError(
+                429,
+                "Too many questions; wait before asking again.",
+                headers={"Retry-After": str(wait)},
+            )
+        return _run_ask(case, question)
+    finally:
+        services.ask_slots.release()
+
+
+def _run_ask(case: CaseSession, question: str) -> m.AgentRun:
+    from caselens_agent.runner import CaseAccessError, ask
+
+    services = case.services
     since = datetime.now(UTC)
     try:
         with services.require_db().session(case.user.id, readonly=True) as readonly_conn:
@@ -170,7 +211,12 @@ def list_runs(
     after = decode_cursor(cursor, (datetime, uuid.UUID))
     rows = case.conn.execute(
         _RUN_PAGE,
-        {"case_id": case.case_id, **cursor_params(after, ("c_ts", "c_id")), "limit": limit + 1},
+        {
+            "case_id": case.case_id,
+            "only_user": own_runs_only(case),
+            **cursor_params(after, ("c_ts", "c_id")),
+            "limit": limit + 1,
+        },
     ).fetchall()
     items = [
         m.AgentRunSummary(
@@ -192,4 +238,4 @@ def list_runs(
 
 @router.get("/runs/{run_id}", response_model=m.AgentRun)
 def get_run(run_id: str, case: ViewerCase) -> m.AgentRun:
-    return load_run(case.conn, case.case_id, parse_id(run_id, "run"))
+    return load_run(case.conn, case.case_id, parse_id(run_id, "run"), own_runs_only(case))

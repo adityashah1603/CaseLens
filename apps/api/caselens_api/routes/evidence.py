@@ -15,6 +15,7 @@ from fastapi.responses import RedirectResponse
 from psycopg.types.json import Jsonb
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
+from starlette.types import Message, Receive
 
 from caselens_api import models as m
 from caselens_api.common import (
@@ -28,7 +29,7 @@ from caselens_api.common import (
     write_audit,
 )
 from caselens_api.db import Conn
-from caselens_api.deps import StoreDep, ViewerCase
+from caselens_api.deps import ServicesDep, StoreDep, ViewerCase, authenticated_session
 from caselens_api.problems import ProblemError, conflict, not_found, validation
 from caselens_api.storage import EvidenceStore, StorageError
 from caselens_workers.storage import evidence_key
@@ -40,6 +41,9 @@ Limit = Annotated[int, Query(ge=1, le=MAX_LIMIT)]
 HASH_CHUNK = 1024 * 1024
 MAX_DESCRIPTION = 2000
 DUPLICATE = "A file with this SHA-256 already exists in this case."
+# Room for the multipart boundaries, part headers and the two small text fields.
+MULTIPART_OVERHEAD = 64 * 1024
+TOO_LARGE = "The file exceeds the upload size limit."
 
 
 # ---- reading -------------------------------------------------------------------------------
@@ -155,12 +159,26 @@ def list_evidence_jobs(evidence_id: str, case: ViewerCase) -> m.IngestJobList:
 
 
 @router.get("/evidence/{evidence_id}/content", status_code=307)
-def get_evidence_content(evidence_id: str, case: ViewerCase, store: StoreDep) -> RedirectResponse:
-    eid = parse_id(evidence_id, "evidence")
-    row = case.conn.execute(
-        "SELECT gcs_uri, sha256 FROM public.evidence WHERE case_id = %s AND id = %s",
-        (case.case_id, eid),
-    ).fetchone()
+def get_evidence_content(
+    case_id: str,
+    evidence_id: str,
+    request: Request,
+    services: ServicesDep,
+    store: StoreDep,
+) -> RedirectResponse:
+    # Three steps so no pool connection is held while the object is streamed and hashed:
+    # (1) authenticate, check membership and read the evidence row, then return the connection;
+    # (2) re-hash the stored object; (3) write the evidence.view audit row as the user in a
+    # short new session. The signed URL is only issued after the audit row is committed.
+    cid = parse_id(case_id, "case")
+    with authenticated_session(services, request.headers.get("authorization")) as session:
+        require_role(session.conn, cid, "viewer")
+        eid = parse_id(evidence_id, "evidence")
+        row = session.conn.execute(
+            "SELECT gcs_uri, sha256 FROM public.evidence WHERE case_id = %s AND id = %s",
+            (cid, eid),
+        ).fetchone()
+        user_id = session.user.id
     if row is None:
         raise not_found("No such evidence.")
     uri, expected = str(row[0]), str(row[1]).strip()
@@ -169,11 +187,11 @@ def get_evidence_content(evidence_id: str, case: ViewerCase, store: StoreDep) ->
     except StorageError:
         actual = None
     ok = actual == expected
-    with case.conn.transaction():
+    with services.require_db().session(user_id) as conn, conn.transaction():
         write_audit(
-            case.conn,
-            case.user.id,
-            case.case_id,
+            conn,
+            user_id,
+            cid,
             "evidence.view",
             {"evidence_id": str(eid), "sha256": expected, "integrity_ok": ok},
         )
@@ -184,7 +202,7 @@ def get_evidence_content(evidence_id: str, case: ViewerCase, store: StoreDep) ->
             "integrity-check-failed",
         )
     try:
-        url = store.signed_url(uri, case.services.settings.signed_url_ttl_s)
+        url = store.signed_url(uri, services.settings.signed_url_ttl_s)
     except StorageError as exc:
         raise ProblemError(503, "Could not create a signed URL for the file.") from exc
     return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store"})
@@ -260,7 +278,7 @@ def _store_upload(
         raise validation("The file needs a filename.", ["body", "file"])
     sha256, size = _hash_and_size(upload.file)
     if size > case.services.settings.max_upload_bytes:
-        raise ProblemError(413, "The file exceeds the upload size limit.")
+        raise ProblemError(413, TOO_LARGE)
     dup = conn.execute(
         "SELECT 1 FROM public.evidence WHERE case_id = %s AND sha256 = %s", (case_id, sha256)
     ).fetchone()
@@ -323,18 +341,38 @@ def _store_upload(
     return load_evidence(conn, case_id, evidence_id)
 
 
+class LimitedReceive:
+    """ASGI receive wrapper that counts request-body bytes as they arrive and aborts with 413
+    once they pass the limit, so a body without Content-Length (chunked) is bounded too."""
+
+    def __init__(self, receive: Receive, limit: int) -> None:
+        self._receive = receive
+        self.limit = limit
+        self.received = 0
+
+    async def __call__(self) -> Message:
+        message = await self._receive()
+        if message["type"] == "http.request":
+            self.received += len(message.get("body", b""))
+            if self.received > self.limit:
+                raise ProblemError(413, TOO_LARGE)
+        return message
+
+
 @router.post("/evidence", response_model=m.Evidence, status_code=201)
 async def upload_evidence(request: Request, case: ViewerCase, store: StoreDep) -> m.Evidence:
     # Role first (403 before any body is read), then size, then the multipart body.
     await run_in_threadpool(require_role, case.conn, case.case_id, "analyst")
-    limit = case.services.settings.max_upload_bytes
+    limit = case.services.settings.max_upload_bytes + MULTIPART_OVERHEAD
     declared = request.headers.get("content-length")
-    if declared is not None and declared.isdigit() and int(declared) > limit + 64 * 1024:
-        raise ProblemError(413, "The file exceeds the upload size limit.")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        raise ProblemError(413, TOO_LARGE)
     content_type = request.headers.get("content-type", "")
     if not content_type.lower().startswith("multipart/form-data"):
         raise ProblemError(415, "The request body must be multipart/form-data.")
-    async with request.form(max_files=1, max_fields=4, max_part_size=MAX_DESCRIPTION * 4) as form:
+    # Enforced while streaming, whatever Content-Length said (or when there is none).
+    limited = Request(request.scope, receive=LimitedReceive(request.receive, limit))
+    async with limited.form(max_files=1, max_fields=4, max_part_size=MAX_DESCRIPTION * 4) as form:
         unknown = sorted(set(form.keys()) - {"file", "description", "recorded_at"})
         if unknown:
             raise validation(f"Unknown form field: {unknown[0]}.", ["body", unknown[0]])

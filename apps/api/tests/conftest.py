@@ -26,8 +26,10 @@ def client(world: World) -> Iterator[TestClient]:
     settings = Settings(
         environment="local",
         database_url=world.url,
+        api_database_url=None,  # never the dev login from a developer's .env
         dev_auth_secret=SecretStr(DEV_SECRET),
-        db_pool_max_size=4,
+        db_pool_max_size=6,
+        warm_up_models=False,
         sse_poll_s=0.05,
         sse_heartbeat_s=0.05,
         sse_max_stream_s=0.6,

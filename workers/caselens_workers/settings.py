@@ -11,6 +11,10 @@ class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CASELENS_", extra="ignore")
 
     database_url: str | None = None
+    # Optional dedicated worker login (caselens_worker_login locally, member of caselens_worker
+    # only) for the ingest loop; falls back to database_url. The dev seeding CLI keeps using
+    # database_url because it acts through caselens_app.
+    worker_database_url: str | None = None
     # Role the worker connection switches to. In compose the login user is the owner, so the
     # worker drops to caselens_worker; in prod the login user is already a member of it.
     worker_db_role: str | None = "caselens_worker"

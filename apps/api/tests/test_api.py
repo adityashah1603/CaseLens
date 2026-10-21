@@ -9,14 +9,21 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
+from caselens_agent.loop import AgentConfig
 from caselens_agent.testing import FakeBackends, ScriptedModel, evidence_result, tool_call
+from caselens_api.auth import CompositeVerifier
 from caselens_api.db import Database
 from caselens_api.deps import RateLimiter, Services
+from caselens_api.main import create_app
 from caselens_api.settings import Settings
 from caselens_api.testing import STATEMENT, World, check, owner_rows, schema_errors
 from caselens_workers.settings import libpq_url
@@ -451,7 +458,11 @@ def _fake_agent(world: World) -> dict[str, Any]:
             }
         ],
     )
-    return {"router": model.router(), "backends": FakeBackends(evidence=[chunk]).backends()}
+    return {
+        "router": model.router(),
+        "backends": FakeBackends(evidence=[chunk]).backends(),
+        "config": AgentConfig(prefetch=False),  # exactly the scripted tool calls
+    }
 
 
 def test_ask_runs_and_rate_limit(client: TestClient, world: World) -> None:
@@ -602,3 +613,233 @@ def test_ingest_events_stream(client: TestClient, world: World) -> None:
     assert any(
         e == "evidence.ready" and d["evidence_id"] == str(world.evidence_id) for e, d in events
     )
+
+
+# ---- security review fixes -----------------------------------------------------------------
+
+
+def _throwaway_login(url: str) -> tuple[str, str]:
+    """Create a SYNTHETIC NOSUPERUSER NOBYPASSRLS login shaped like caselens_api_login; return
+    (role name, conninfo)."""
+    name = f"caselens_test_login_{uuid.uuid4().hex[:8]}"
+    password = uuid.uuid4().hex
+    with psycopg.connect(libpq_url(url), autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT PASSWORD {}").format(
+                sql.Identifier(name), sql.Literal(password)
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT caselens_app, caselens_readonly TO {}").format(sql.Identifier(name))
+        )
+    return name, make_conninfo(libpq_url(url), user=name, password=password)
+
+
+def _drop_login(url: str, name: str) -> None:
+    with psycopg.connect(libpq_url(url), autocommit=True) as conn:
+        conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name)))
+
+
+def test_api_pool_uses_dedicated_non_superuser_login(world: World) -> None:
+    name, login_url = _throwaway_login(world.url)
+    try:
+        settings = Settings(
+            environment="prod",
+            database_url=world.url,
+            api_database_url=login_url,
+            warm_up_models=False,
+        )
+        app = create_app(settings, verifier=CompositeVerifier(None, None))
+        with TestClient(app) as test_client:  # the strict startup check passes
+            db = services(test_client).require_db()
+            info = db.login_info()
+            assert (info.name, info.superuser, info.bypass_rls) == (name, False, False)
+            with db.session(world.users["lead"]) as conn:
+                row = conn.execute(
+                    "SELECT session_user, current_user, (SELECT count(*) FROM public.cases)"
+                ).fetchone()
+                assert row is not None and row[:2] == (name, "caselens_app") and row[2] >= 1
+            with db.pool.connection() as raw, pytest.raises(psycopg.errors.InsufficientPrivilege):
+                raw.execute("SELECT count(*) FROM public.cases")  # no privileges as itself
+    finally:
+        _drop_login(world.url, name)
+
+
+def test_superuser_login_refused_outside_local(world: World) -> None:
+    rolsuper = owner_rows(
+        world.url, "SELECT rolsuper FROM pg_roles WHERE rolname = session_user", ()
+    )[0][0]
+    assert rolsuper, "the test database URL is expected to be the owner superuser"
+    app = create_app(
+        Settings(
+            environment="prod",
+            database_url=world.url,
+            api_database_url=None,
+            warm_up_models=False,
+        ),
+        verifier=CompositeVerifier(None, None),
+    )
+    with pytest.raises(RuntimeError, match="superuser"), TestClient(app):
+        pass
+    local = create_app(
+        Settings(
+            environment="local",
+            database_url=world.url,
+            api_database_url=None,
+            warm_up_models=False,
+        ),
+        verifier=CompositeVerifier(None, None),
+    )
+    with TestClient(local) as test_client:  # local: warns and starts
+        assert check(test_client.get("/healthz"), 200, "Health")["status"] == "ok"
+
+
+def test_ask_concurrency_bound_returns_429(client: TestClient, world: World) -> None:
+    svc = services(client)
+    svc.ask_kwargs = _fake_agent(world)
+    original = svc.ask_slots
+    svc.ask_slots = threading.BoundedSemaphore(1)
+    url = f"/v1/cases/{world.case_id}/ask"
+    q = {"question": "Who was in the gray sedan on March 14?"}
+    try:
+        assert svc.ask_slots.acquire(blocking=False)  # one run in flight
+        resp = client.post(url, json=q, headers=world.auth("analyst"))
+        check(resp, 429)
+        assert int(resp.headers["retry-after"]) >= 1
+        svc.ask_slots.release()
+        check(client.post(url, json=q, headers=world.auth("analyst")), 200, "AgentRun")
+        assert svc.ask_slots.acquire(blocking=False)  # the slot was released after the run
+        svc.ask_slots.release()
+    finally:
+        svc.ask_slots = original
+
+
+def test_demo_users_see_only_their_runs_and_are_limited_per_ip(
+    client: TestClient, world: World
+) -> None:
+    svc = services(client)
+    svc.ask_kwargs = _fake_agent(world)
+    base = f"/v1/cases/{world.case_id}"
+    q = {"question": "Who was in the gray sedan on March 14?"}
+    other = check(client.post(f"{base}/ask", json=q, headers=world.auth("viewer")), 200, "AgentRun")
+    original_limiter, original_hops = svc.ask_limiter, svc.settings.trusted_proxy_hops
+    svc.ask_limiter = RateLimiter(1, 60)
+    try:
+        demo = check(
+            client.post(f"{base}/ask", json=q, headers=world.auth("demo")), 200, "AgentRun"
+        )
+        # same client address -> limited (the demo login is shared, so the key is the address)
+        check(client.post(f"{base}/ask", json=q, headers=world.auth("demo")), 429)
+        # forwarded addresses are ignored unless proxies are trusted ...
+        spoof = {**world.auth("demo"), "X-Forwarded-For": "203.0.113.10"}
+        check(client.post(f"{base}/ask", json=q, headers=spoof), 429)
+        # ... and with one trusted proxy each client address has its own budget
+        svc.settings.trusted_proxy_hops = 1
+        check(client.post(f"{base}/ask", json=q, headers=spoof), 200, "AgentRun")
+        # non-demo users keep their per-user budget
+        check(client.post(f"{base}/ask", json=q, headers=world.auth("analyst")), 200, "AgentRun")
+    finally:
+        svc.ask_limiter, svc.settings.trusted_proxy_hops = original_limiter, original_hops
+
+    mine = check(client.get(f"{base}/runs", headers=world.auth("demo")), 200, "AgentRunList")
+    assert mine["items"] and {r["user_id"] for r in mine["items"]} == {str(world.users["demo"])}
+    assert demo["id"] in {r["id"] for r in mine["items"]}
+    check(client.get(f"{base}/runs/{other['id']}", headers=world.auth("demo")), 404)
+    check(client.get(f"{base}/runs/{demo['id']}", headers=world.auth("demo")), 200, "AgentRun")
+    everyone = check(client.get(f"{base}/runs", headers=world.auth("viewer")), 200, "AgentRunList")
+    users = {r["user_id"] for r in everyone["items"]}
+    assert {str(world.users["demo"]), str(world.users["viewer"])} <= users
+    check(client.get(f"{base}/runs/{demo['id']}", headers=world.auth("viewer")), 200, "AgentRun")
+
+
+def test_demo_user_cannot_be_promoted(client: TestClient, world: World) -> None:
+    case_id = new_case(client, world, "SYNTHETIC demo-role case")
+    base = f"/v1/cases/{case_id}/members"
+    lead = world.auth("lead")
+    demo = str(world.users["demo"])
+    for role in ("analyst", "lead"):
+        check(client.post(base, json={"user_id": demo, "role": role}, headers=lead), 403)
+    check(
+        client.post(base, json={"user_id": demo, "role": "viewer"}, headers=lead),
+        201,
+        "CaseMember",
+    )
+    for role in ("analyst", "lead"):
+        check(client.patch(f"{base}/{demo}", json={"role": role}, headers=lead), 403)
+    roles = owner_rows(
+        world.url,
+        "SELECT role FROM public.case_members WHERE case_id = %s AND user_id = %s",
+        (uuid.UUID(case_id), world.users["demo"]),
+    )
+    assert roles == [("viewer",)]
+
+
+def _multipart_chunks(boundary: str, size: int) -> Iterator[bytes]:
+    yield (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        'filename="SYNTHETIC_big.csv"\r\nContent-Type: text/csv\r\n\r\n'
+    ).encode()
+    chunk = b"SYNTHETIC,row\n" * 4096
+    sent = 0
+    while sent < size:
+        yield chunk
+        sent += len(chunk)
+    yield f"\r\n--{boundary}--\r\n".encode()
+
+
+def test_upload_limit_enforced_while_streaming(client: TestClient, world: World) -> None:
+    svc = services(client)
+    original = svc.settings.max_upload_bytes
+    svc.settings.max_upload_bytes = 1024
+    boundary = "SYNTHETICboundary" + uuid.uuid4().hex
+    count = "SELECT count(*) FROM public.evidence WHERE case_id = %s"
+    before = owner_rows(world.url, count, (world.case_id,))
+    try:
+        resp = client.post(
+            f"/v1/cases/{world.case_id}/evidence",
+            content=_multipart_chunks(boundary, 512 * 1024),  # chunked: no Content-Length
+            headers={
+                **world.auth("analyst"),
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        assert "content-length" not in {k.lower() for k in resp.request.headers}
+        check(resp, 413)
+    finally:
+        svc.settings.max_upload_bytes = original
+    assert owner_rows(world.url, count, (world.case_id,)) == before
+
+
+def test_content_hashes_without_holding_a_connection(
+    client: TestClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pool = services(client).require_db().pool
+    in_use: list[int] = []
+    real = world.store.sha256
+
+    def spy(uri: str) -> str:
+        # Every pool connection can be checked out while the object is hashed: the request
+        # holds none (a held one would make the last getconn time out).
+        held = [pool.getconn(timeout=3) for _ in range(pool.max_size)]
+        for conn in held:
+            pool.putconn(conn)
+        in_use.append(pool.max_size - len(held))
+        return real(uri)
+
+    monkeypatch.setattr(world.store, "sha256", spy)
+    url = f"/v1/cases/{world.case_id}/evidence/{world.evidence_id}/content"
+    resp = client.get(url, headers=world.auth("viewer"), follow_redirects=False)
+    assert resp.status_code == 307
+    assert in_use == [0]
+    check(client.get(url, headers=world.auth("outsider"), follow_redirects=False), 404)
+    check(client.get(url, follow_redirects=False), 401)
+    missing = f"/v1/cases/{world.case_id}/evidence/{uuid.uuid4()}/content"
+    check(client.get(missing, headers=world.auth("viewer"), follow_redirects=False), 404)
+    assert in_use == [0]  # rejected requests never reach the store
+    rows = owner_rows(
+        world.url,
+        "SELECT user_id, payload ->> 'integrity_ok' FROM public.audit_log "
+        "WHERE action = 'evidence.view' AND payload ->> 'evidence_id' = %s ORDER BY id",
+        (str(world.evidence_id),),
+    )
+    assert rows[-1] == (world.users["viewer"], "true")

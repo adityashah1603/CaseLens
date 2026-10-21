@@ -10,6 +10,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-caselens}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
       POSTGRES_DB: ${POSTGRES_DB:-caselens}
+      # Passwords for the dedicated API / worker logins (init/02-login-roles.sh, fresh volume).
+      CASELENS_API_DB_PASSWORD: ${CASELENS_API_DB_PASSWORD:-}
+      CASELENS_WORKER_DB_PASSWORD: ${CASELENS_WORKER_DB_PASSWORD:-}
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:

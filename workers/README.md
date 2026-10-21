@@ -28,7 +28,9 @@ python -m caselens_workers status
 ```
 
 `submit` seeds a generated case as a case lead through `caselens_app` and RLS, the same path the API
-upload will take. Workers connect as `caselens_worker`.
+upload will take. Workers connect as `caselens_worker`: with `CASELENS_WORKER_DATABASE_URL` set
+(the dedicated `caselens_worker_login`, see `apps/api/README.md` "Database logins") the ingest loop
+logs in with it, otherwise with `CASELENS_DATABASE_URL`; `submit` keeps using `CASELENS_DATABASE_URL`.
 
 ## Pipelines
 

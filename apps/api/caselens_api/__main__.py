@@ -92,9 +92,9 @@ def _ensure_member(
 def cmd_seed_dev_users(args: argparse.Namespace, settings: Settings) -> int:
     """Through RLS as the seed lead: add the demo viewer and an analyst to the demo case."""
     verifier = _dev_verifier(settings)
-    if not settings.database_url:
-        raise SystemExit("CASELENS_DATABASE_URL is not set")
-    db = Database(settings.database_url, settings.app_db_role, settings.readonly_db_role, 1, 1)
+    if not settings.pool_url:
+        raise SystemExit("CASELENS_API_DATABASE_URL (or CASELENS_DATABASE_URL) is not set")
+    db = Database(settings.pool_url, settings.app_db_role, settings.readonly_db_role, 1, 1)
     db.pool.open(wait=True)
     try:
         with db.session(None) as conn:

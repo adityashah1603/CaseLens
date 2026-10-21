@@ -6,7 +6,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -20,6 +21,24 @@ from caselens_api.settings import Settings
 from caselens_api.storage import EvidenceStore
 
 AskFn = Callable[..., Any]
+MAX_LIMITER_KEYS = 10_000
+
+
+def client_ip(request: Request, trusted_proxy_hops: int) -> str:
+    """The caller's address: the socket peer, or with N trusted proxies the N-th
+    X-Forwarded-For entry from the right (entries further left are client-controlled)."""
+    peer = request.client.host if request.client else "unknown"
+    if trusted_proxy_hops <= 0:
+        return peer
+    forwarded = [
+        part.strip()
+        for header in request.headers.getlist("x-forwarded-for")
+        for part in header.split(",")
+        if part.strip()
+    ]
+    if len(forwarded) < trusted_proxy_hops:
+        return peer
+    return forwarded[-trusted_proxy_hops]
 
 
 class RateLimiter:
@@ -29,13 +48,17 @@ class RateLimiter:
     def __init__(self, limit: int, window_s: float) -> None:
         self.limit = limit
         self.window_s = window_s
-        self._hits: dict[uuid.UUID, deque[float]] = {}
+        self._hits: dict[Hashable, deque[float]] = {}
         self._lock = threading.Lock()
 
-    def check(self, key: uuid.UUID) -> int | None:
+    def check(self, key: Hashable) -> int | None:
         """Record a hit and return None, or return the seconds to wait when over the limit."""
         now = time.monotonic()
         with self._lock:
+            if len(self._hits) >= MAX_LIMITER_KEYS:  # per-IP keys: drop idle ones
+                cutoff = now - self.window_s
+                for idle in [k for k, h in self._hits.items() if not h or h[-1] <= cutoff]:
+                    del self._hits[idle]
             hits = self._hits.setdefault(key, deque())
             while hits and hits[0] <= now - self.window_s:
                 hits.popleft()
@@ -53,13 +76,15 @@ class Services:
     db: Database | None
     store_factory: Callable[[], EvidenceStore]
     ask_limiter: RateLimiter
+    # Bounds concurrent /ask runs (each holds two pool connections for the whole run).
+    ask_slots: threading.BoundedSemaphore
     # The agent entry point (`caselens_agent.runner.ask`); tests swap in a fake router.
     ask_kwargs: dict[str, Any] = field(default_factory=dict)
     _store: EvidenceStore | None = None
 
     def require_db(self) -> Database:
         if self.db is None:
-            raise ProblemError(503, "The database is not configured (CASELENS_DATABASE_URL).")
+            raise ProblemError(503, "The database is not configured (CASELENS_API_DATABASE_URL).")
         return self.db
 
     def store(self) -> EvidenceStore:
@@ -92,13 +117,20 @@ class Session:
     services: Services
 
 
-def get_session(request: Request, services: ServicesDep) -> Iterator[Session]:
-    identity = verify_or_401(services.verifier, request.headers.get("authorization"))
+@contextmanager
+def authenticated_session(services: Services, authorization: str | None) -> Iterator[Session]:
+    """Verify the bearer token, then hold one pooled connection as the resolved user."""
+    identity = verify_or_401(services.verifier, authorization)
     db = services.require_db()
     with db.session(None) as conn:
         user = resolve_user(conn, identity)
         set_user(conn, user.id)
         yield Session(conn, user, services)
+
+
+def get_session(request: Request, services: ServicesDep) -> Iterator[Session]:
+    with authenticated_session(services, request.headers.get("authorization")) as session:
+        yield session
 
 
 SessionDep = Annotated[Session, Depends(get_session)]

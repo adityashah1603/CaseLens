@@ -7,13 +7,28 @@ export interface FirebaseWebConfig {
   appId: string;
 }
 
-type FirebaseEnv = Pick<
-  ImportMetaEnv,
-  "VITE_FIREBASE_API_KEY" | "VITE_FIREBASE_AUTH_DOMAIN" | "VITE_FIREBASE_PROJECT_ID" | "VITE_FIREBASE_APP_ID"
+type FirebaseEnv = Partial<
+  Record<
+    "VITE_FIREBASE_API_KEY" | "VITE_FIREBASE_AUTH_DOMAIN" | "VITE_FIREBASE_PROJECT_ID" | "VITE_FIREBASE_APP_ID",
+    string | undefined
+  >
 >;
 
+/**
+ * The `VITE_FIREBASE_*` values, read one by one: passing `import.meta.env` as a whole object would
+ * make Vite inline every `VITE_*` value (dev tokens included) into the production bundle.
+ */
+function firebaseEnv(): FirebaseEnv {
+  return {
+    VITE_FIREBASE_API_KEY: import.meta.env.VITE_FIREBASE_API_KEY,
+    VITE_FIREBASE_AUTH_DOMAIN: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+    VITE_FIREBASE_PROJECT_ID: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+    VITE_FIREBASE_APP_ID: import.meta.env.VITE_FIREBASE_APP_ID,
+  };
+}
+
 /** The Firebase web config, or null unless every `VITE_FIREBASE_*` value is set. */
-export function firebaseConfig(env: FirebaseEnv = import.meta.env): FirebaseWebConfig | null {
+export function firebaseConfig(env: FirebaseEnv = firebaseEnv()): FirebaseWebConfig | null {
   const apiKey = env.VITE_FIREBASE_API_KEY;
   const authDomain = env.VITE_FIREBASE_AUTH_DOMAIN;
   const projectId = env.VITE_FIREBASE_PROJECT_ID;

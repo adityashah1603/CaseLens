@@ -9,9 +9,11 @@ reset is discarded). Connections are autocommit; writes are grouped with `conn.t
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import psycopg
 from psycopg import sql
@@ -21,6 +23,23 @@ from psycopg_pool import ConnectionPool
 from caselens_workers.settings import libpq_url
 
 Conn = psycopg.Connection[TupleRow]
+log = logging.getLogger(__name__)
+
+_LOGIN = (
+    "SELECT r.rolname, r.rolsuper, r.rolbypassrls FROM pg_catalog.pg_roles AS r "
+    "WHERE r.rolname = session_user"
+)
+
+
+@dataclass(frozen=True)
+class LoginInfo:
+    name: str
+    superuser: bool
+    bypass_rls: bool
+
+    @property
+    def unsafe(self) -> bool:
+        return self.superuser or self.bypass_rls
 
 
 def set_user(conn: Conn, user_id: uuid.UUID | None) -> None:
@@ -64,6 +83,36 @@ class Database:
 
     def close(self) -> None:
         self.pool.close()
+
+    def login_info(self, timeout: float = 30.0) -> LoginInfo:
+        """Attributes of the role this pool logs in as (session_user, not the SET ROLE one)."""
+        with self.pool.connection(timeout=timeout) as conn:
+            row = conn.execute(_LOGIN).fetchone()
+        if row is None:
+            raise RuntimeError("the database login role is not visible in pg_roles")
+        return LoginInfo(str(row[0]), bool(row[1]), bool(row[2]))
+
+    def check_login(self, *, strict: bool, timeout: float = 30.0) -> LoginInfo | None:
+        """Refuse (strict) or warn (local) when the pool's login is superuser or BYPASSRLS.
+
+        Strict mode also refuses when the login cannot be checked at all."""
+        try:
+            info = self.login_info(timeout)
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"could not verify the database login role: {exc}") from exc
+            log.warning("could not verify the database login role: %s", exc)
+            return None
+        if info.unsafe:
+            message = (
+                f"the API database login {info.name!r} is "
+                f"{'a superuser' if info.superuser else 'BYPASSRLS'}; use a dedicated "
+                "NOSUPERUSER NOBYPASSRLS login (CASELENS_API_DATABASE_URL, see apps/api/README.md)"
+            )
+            if strict:
+                raise RuntimeError(message)
+            log.warning("%s (allowed only because CASELENS_ENVIRONMENT=local)", message)
+        return info
 
     @contextmanager
     def session(self, user_id: uuid.UUID | None, *, readonly: bool = False) -> Iterator[Conn]:

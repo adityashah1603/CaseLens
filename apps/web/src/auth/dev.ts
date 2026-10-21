@@ -7,18 +7,34 @@ export interface DevIdentity {
   token: string | undefined;
 }
 
-type DevEnv = Pick<ImportMetaEnv, "VITE_DEV_TOKEN_LEAD" | "VITE_DEV_TOKEN_ANALYST" | "VITE_DEV_TOKEN_VIEWER">;
+type DevEnv = Partial<Record<"VITE_DEV_TOKEN_LEAD" | "VITE_DEV_TOKEN_ANALYST" | "VITE_DEV_TOKEN_VIEWER", string | undefined>>;
 
-/** Dev sign-in is offered only outside production builds. */
-export function devSignInEnabled(mode: string = import.meta.env.MODE): boolean {
-  return mode !== "production";
+/** Dev sign-in is offered only in dev builds (`vite` / vitest), never in `vite build`. */
+export function devSignInEnabled(mode: string = import.meta.env.MODE, dev: boolean = import.meta.env.DEV): boolean {
+  return dev && mode !== "production";
+}
+
+/**
+ * The dev tokens from `apps/web/.env.local`, read one by one behind `import.meta.env.DEV`. In a
+ * production build `DEV` is the literal `false`, so the whole branch (and every token value) is
+ * dropped from the bundle. Never pass `import.meta.env` as a whole object here: Vite would inline
+ * every `VITE_*` value into the bundle.
+ */
+export function devTokenEnv(): DevEnv {
+  return import.meta.env.DEV
+    ? {
+        VITE_DEV_TOKEN_LEAD: import.meta.env.VITE_DEV_TOKEN_LEAD,
+        VITE_DEV_TOKEN_ANALYST: import.meta.env.VITE_DEV_TOKEN_ANALYST,
+        VITE_DEV_TOKEN_VIEWER: import.meta.env.VITE_DEV_TOKEN_VIEWER,
+      }
+    : {};
 }
 
 /**
  * The named dev identities. Tokens come from `apps/web/.env.local` (gitignored), minted by
- * `python -m caselens_api seed-dev-users`.
+ * `python -m caselens_api seed-dev-users`, and only in dev builds (see `devTokenEnv`).
  */
-export function devIdentities(env: DevEnv = import.meta.env): DevIdentity[] {
+export function devIdentities(env: DevEnv = devTokenEnv()): DevIdentity[] {
   const clean = (v: string | undefined): string | undefined => (v === undefined || v.trim() === "" ? undefined : v.trim());
   return [
     {

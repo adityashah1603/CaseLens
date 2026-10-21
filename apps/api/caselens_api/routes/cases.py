@@ -234,6 +234,13 @@ def list_members(
     return m.CaseMemberList(items=[_member(r) for r in rows[:limit]], next_cursor=nxt)
 
 
+def _demo_role_check(conn: Conn, user_id: uuid.UUID, role: str) -> None:
+    """The shared demo login stays read-only on every case: never above viewer."""
+    row = conn.execute("SELECT is_demo FROM public.users WHERE id = %s", (user_id,)).fetchone()
+    if row is not None and row[0] and m.ROLE_RANK[role] > m.ROLE_RANK["viewer"]:
+        raise forbidden("The demo user can only be a viewer.")
+
+
 @router.post("/cases/{case_id}/members", response_model=m.CaseMember, status_code=201)
 def add_member(body: m.CaseMemberCreate, case: LeadCase) -> m.CaseMember:
     conn = case.conn
@@ -248,6 +255,7 @@ def add_member(body: m.CaseMemberCreate, case: LeadCase) -> m.CaseMember:
     if row is None:
         raise not_found("No such user. They must sign in once before they can be added.")
     user_id: uuid.UUID = row[0]
+    _demo_role_check(conn, user_id, body.role)
     if _load_member(conn, case.case_id, user_id) is not None:
         raise conflict("This user is already a member of the case.", "already-member")
     try:
@@ -285,6 +293,7 @@ def update_member(user_id: str, body: m.CaseMemberUpdate, case: LeadCase) -> m.C
         current = _load_member(conn, case.case_id, uid)
         if current is None:
             raise not_found("No such member.")
+        _demo_role_check(conn, uid, body.role)
         if body.role != "lead" and _would_remove_last_lead(conn, case.case_id, uid):
             raise conflict("The case must keep at least one lead.", "last-lead")
         conn.execute(

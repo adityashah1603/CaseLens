@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg_pool import PoolTimeout
+from starlette.concurrency import run_in_threadpool
 
 from caselens_api import __version__
 from caselens_api import models as m
@@ -22,6 +25,18 @@ from caselens_api.routes import agent, audit, cases, evidence, graph, ingest
 from caselens_api.settings import Settings, get_settings
 from caselens_api.storage import EvidenceStore, S3EvidenceStore
 
+log = logging.getLogger(__name__)
+
+
+def _warm_up_retrieval() -> None:
+    """Best effort: a missing model only costs the first question its load time."""
+    try:
+        from caselens_retrieval.encoders import warm_up
+
+        warm_up()
+    except Exception as exc:
+        log.warning("retrieval model warm-up failed: %s", exc)
+
 
 def create_app(
     settings: Settings | None = None,
@@ -32,13 +47,13 @@ def create_app(
     ask_kwargs: dict[str, Any] | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
-    if database is None and settings.database_url:
+    if database is None and settings.pool_url:
         database = Database(
-            settings.database_url,
+            settings.pool_url,
             settings.app_db_role,
             settings.readonly_db_role,
             settings.db_pool_min_size,
-            settings.db_pool_max_size,
+            settings.pool_max_size,
         )
     services = Services(
         settings=settings,
@@ -46,6 +61,7 @@ def create_app(
         db=database,
         store_factory=store_factory or (lambda: S3EvidenceStore(settings)),
         ask_limiter=RateLimiter(settings.ask_rate_limit, settings.ask_rate_window_s),
+        ask_slots=threading.BoundedSemaphore(settings.ask_max_concurrent),
         ask_kwargs=dict(ask_kwargs or {}),
     )
 
@@ -53,6 +69,17 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if services.db is not None:
             services.db.open()
+            try:
+                # Outside local the app refuses to start on a superuser / BYPASSRLS login (or
+                # one it cannot check); locally it only warns, and does not wait long for a
+                # database that is not up yet.
+                strict = not settings.is_local
+                services.db.check_login(strict=strict, timeout=30.0 if strict else 5.0)
+            except Exception:
+                services.db.close()
+                raise
+        if settings.warm_up_models and "backends" not in services.ask_kwargs:
+            await run_in_threadpool(_warm_up_retrieval)
         try:
             yield
         finally:

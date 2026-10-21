@@ -27,9 +27,10 @@ def connect(url: str, role: str | None, user_id: uuid.UUID | None = None) -> Con
 
 
 def worker_connection(settings: WorkerSettings) -> Conn:
-    if not settings.database_url:
-        raise RuntimeError("CASELENS_DATABASE_URL is not set")
-    return connect(settings.database_url, settings.worker_db_role)
+    url = settings.worker_database_url or settings.database_url
+    if not url:
+        raise RuntimeError("CASELENS_WORKER_DATABASE_URL (or CASELENS_DATABASE_URL) is not set")
+    return connect(url, settings.worker_db_role)
 
 
 def vector_literal(values: Any) -> str:
