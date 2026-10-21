@@ -1,10 +1,12 @@
 import { FolderOpen } from "lucide-react";
-import { Link } from "react-router";
-import { useCases } from "../../api/queries.ts";
+import { Link, Navigate, useLocation } from "react-router";
+import { useCases, useMe } from "../../api/queries.ts";
+import { useAuth } from "../../auth/AuthContext.ts";
 import type { Case } from "../../api/types.ts";
 import { Empty, ErrorBox, Loading } from "../../components/Feedback.tsx";
 import { Badge } from "../../components/ui/badge.tsx";
 import { formatTs } from "../../lib/format.ts";
+import { isBrowsing } from "../../lib/nav.ts";
 
 function IngestStatus({ c }: { c: Case }) {
   const s = c.ingest_summary;
@@ -17,6 +19,17 @@ function IngestStatus({ c }: { c: Case }) {
 
 export function CasesPage() {
   const cases = useCases();
+  const me = useMe();
+  const { session } = useAuth();
+  const location = useLocation();
+  const items = cases.data?.items;
+  // A demo visitor (anonymous Firebase sign-in, or the API's demo user) has just the demo case:
+  // open it straight away, unless they navigated back to the list on purpose.
+  const demoVisitor = session?.source === "firebase" || me.data?.user.is_demo === true;
+  const only = items?.length === 1 ? items[0] : undefined;
+  if (demoVisitor && only !== undefined && !isBrowsing(location.state)) {
+    return <Navigate to={`/cases/${only.id}`} replace />;
+  }
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-col gap-4 p-4">
       <h1 className="text-lg font-semibold text-slate-900">Your cases</h1>

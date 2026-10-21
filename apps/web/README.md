@@ -3,7 +3,7 @@
 **Owner:** frontend agent.
 
 React 19 + TypeScript (strict) on Vite, Tailwind v4 with copied-in shadcn/ui components,
-TanStack Query, React Router, pdf.js. Every page shows the `SYNTHETIC DATA` banner.
+TanStack Query, React Router, pdf.js, Firebase Auth (modular SDK, lazy-loaded). Every page shows the `SYNTHETIC DATA` banner.
 
 ## Requirements
 
@@ -20,13 +20,19 @@ pnpm dev                          # http://localhost:5173
 
 | Variable | Purpose |
 | --- | --- |
-| `VITE_API_BASE_URL` | API origin, default `http://127.0.0.1:8000` |
-| `VITE_DEV_TOKEN_LEAD` / `_ANALYST` / `_VIEWER` | Local dev tokens from `python -m caselens_api seed-dev-users` |
-| `VITE_FIREBASE_API_KEY`, `_AUTH_DOMAIN`, `_PROJECT_ID`, `_APP_ID` | Firebase web config (Week 6); blank hides Firebase sign-in |
+| `VITE_API_BASE_URL` | API origin. Unset or blank: `http://127.0.0.1:8000` in dev, and same-origin relative URLs in a production build (the API serves the SPA) |
+| `VITE_DEV_TOKEN_LEAD` / `_ANALYST` / `_VIEWER` | Local dev tokens from `python -m caselens_api seed-dev-users` (dev builds only) |
+| `VITE_FIREBASE_API_KEY`, `_AUTH_DOMAIN`, `_PROJECT_ID`, `_APP_ID` | Firebase web config. All four set: the "Try the demo" button. Any blank: hidden |
 
-The API must allow CORS from the dev origin (with the `Authorization` header), and the object
-store must allow CORS GETs for the signed content URLs (the browser follows the 307 from
-`/evidence/{id}/content`).
+Vite also reads `.env.local` in `vite build`. For a same-origin production build, leave
+`VITE_API_BASE_URL` blank there (or keep the dev value in `.env.development.local`), or build with
+`VITE_API_BASE_URL= pnpm build`. The Firebase web config is public by design (it identifies the
+project, it is not a secret); the dev tokens never reach a production bundle (`pnpm check:bundle`).
+
+In dev the API must allow CORS from the dev origin (with the `Authorization` header), and the
+object store must allow CORS GETs for the signed content URLs (the browser follows the 307 from
+`/evidence/{id}/content`). In production everything is same-origin, signed URLs included
+(`/storage/...`), so no CORS is needed.
 
 ## Commands
 
@@ -36,6 +42,7 @@ pnpm lint        # eslint (typescript-eslint strict type-checked, react-hooks)
 pnpm typecheck   # tsc -b --noEmit
 pnpm test        # vitest + Testing Library + MSW (jsdom)
 pnpm build       # tsc -b && vite build
+pnpm check:bundle  # after build: fail if dist/ contains a JWT-looking string or a dev token
 ```
 
 ## Layout
@@ -44,10 +51,10 @@ pnpm build       # tsc -b && vite build
 | --- | --- |
 | `src/api/schema.d.ts` | **Generated** contract types. Never edit by hand; run `pnpm gen:api`. |
 | `src/api/client.ts` | Typed `openapi-fetch` client with the bearer token; `ApiError` from RFC 9457 problems |
-| `src/api/content.ts` | Evidence originals: fetch `/content` with the token, follow the 307, 409 becomes `IntegrityError` |
+| `src/api/content.ts` | Evidence originals: fetch `/content` with the token, follow the 307, 409 becomes `IntegrityError`. PDF/CSV come back as a Blob; audio/video resolve to the signed URL |
 | `src/api/sse.ts` | Fetch-based SSE reader for `/ingest/events` (EventSource cannot send auth headers), reconnects with `Last-Event-ID` |
 | `src/api/queries.ts` | TanStack Query hooks for every contract route the UI uses |
-| `src/auth/` | `AuthProvider` interface, dev sign-in, Firebase stub, tab-scoped session |
+| `src/auth/` | `AuthProvider` interface, dev sign-in, Firebase anonymous demo sign-in, tab-scoped session |
 | `src/features/ask/` | Ask panel, answer rendering (claims, citations, conflicts, confidence, open questions), agent trace |
 | `src/features/viewer/` | Evidence viewer: PDF page + bbox (pdf.js), audio span, video frame + bbox, CSV row |
 | `src/features/timeline/`, `entities/`, `evidence/`, `audit/`, `admin/` | The other workspace tabs and the admin page |
@@ -55,21 +62,29 @@ pnpm build       # tsc -b && vite build
 
 ## Screens
 
-1. **Sign-in.** In non-production builds it lists the dev lead, analyst and viewer identities
-   (tokens from `.env.local`) and offers a paste-a-token field. The session lives in
-   `sessionStorage` only. A 401 from the API signs the user out with a notice.
+1. **Sign-in.** With the Firebase config, a "Try the demo (read-only)" button signs in anonymously
+   (the API maps that user to the shared read-only demo viewer), explains that all data is
+   SYNTHETIC, and shows an "About this demo" panel. After sign-in a visitor whose case list holds a
+   single case goes straight into it (the Cases link still shows the list). In dev builds only
+   (`import.meta.env.DEV`) it also lists the dev lead, analyst and viewer identities (tokens from
+   `.env.local`) and offers a paste-a-token field. The session lives in `sessionStorage` only. A
+   401 from the API signs the user out with a notice (after one token refresh for Firebase).
 2. **Cases.** Role, evidence count, ingest status, last activity.
 3. **Case workspace.** Tabs on the left, evidence viewer on the right (stacked below on narrow screens).
    - **Ask.** Question box, suggested questions, elapsed timer and "Stop waiting" while the run is
-     in flight (20 to 60 s), recent runs. Answers show a summary, claim cards with numbered
+     in flight (10 to 60 s on the free-tier LLM), recent runs. The demo case shows a collapsible
+     "About this demo" panel in its header. Answers show a summary, claim cards with numbered
      citation chips, conflicts side by side, confidence, open questions, a source list and the
      tool trace (plan, inputs, SQL, latency, tokens, cost). A claim (or conflict side) whose
      citation ids do not resolve is withheld, and an `answered` result with no resolvable claim is
      not shown. Uncited text is never rendered as a supported claim.
    - **Evidence viewer.** PDF: pdf.js renders the cited page and outlines the bbox. The bbox is in
      PDF points with a top-left origin (as PyMuPDF and the OCR stage write it), and it is mapped
-     through the pdf.js viewport (y flip, scale, rotation). Audio: seeks to `start_ms`, shows the
-     speaker and span, and "Play cited span" stops at `end_ms`. Video: paused at `start_ms` with
+     through the pdf.js viewport (y flip, scale, rotation). Audio and video: the element is pointed
+     at the short-lived signed URL (from the `/content` 307), so the browser streams it with Range
+     requests and seeking does not download the whole file. A fresh URL is requested whenever a
+     citation opens, and once more if the element fails to load it (expired while open). Audio:
+     seeks to `start_ms`, shows the speaker and span, and "Play cited span" stops at `end_ms`. Video: paused at `start_ms` with
      the bbox (original frame pixels) scaled to the rendered size. CSV: the row whose `row_id`
      matches, with three neighbours each side, skipping the `# SYNTHETIC` comment line. A 409 shows
      an integrity-failure notice and nothing else.
@@ -85,13 +100,19 @@ pnpm build       # tsc -b && vite build
 
 Role gating in the UI hides mutating actions; the server stays the authority (403s are shown as such).
 
-## Firebase (Week 6)
+## Firebase demo sign-in
 
-`src/auth/firebase.ts` reads the `VITE_FIREBASE_*` config and exposes a `FirebaseAuthProvider`
-that is offered only when the config exists. It does not bundle the Firebase SDK yet. To wire it:
-add `firebase`, initialise the app from the config, sign in with Google (or the demo credentials),
-return `user.getIdToken()` as the session token, refresh it before its roughly 1 hour expiry, and
-hide dev sign-in in production (already enforced by `import.meta.env.MODE`).
+`src/auth/firebase.ts` implements the `AuthProvider` with the modular SDK (`firebase/app` +
+`firebase/auth` only). The SDK is imported dynamically on first use, so it is a separate chunk
+(about 46 kB gzipped) that is not part of the first paint and never loads without the config.
+
+- Config: the four `VITE_FIREBASE_*` variables, each read individually (never `import.meta.env`
+  as a whole object). Persistence: `browserSessionPersistence` (ends with the tab).
+- Sign-in: `signInAnonymously`. Enable the Anonymous provider in the Firebase console and add the
+  Space's domain to the authorized domains.
+- Token: the bearer token is the Firebase ID token from `getIdToken()`, which the SDK caches and
+  refreshes near its ~1 h expiry. On a 401 the client forces one refresh (`getIdToken(true)`) and
+  retries the request once; a second 401 signs out. Sign-out also signs out of Firebase.
 
 ## Notes
 

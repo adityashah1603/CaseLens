@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { AuthContext } from "./AuthContext.ts";
+import { firebaseProvider } from "./firebase.ts";
 import type { AuthSession, AuthState } from "./types.ts";
 
 const STORAGE_KEY = "caselens.session";
@@ -39,6 +40,8 @@ export function SessionProvider({ children, initial }: { children: ReactNode; in
   }, []);
 
   const signOut = useCallback((reason?: string) => {
+    // Ends the Firebase session too (a no-op unless the SDK was loaded in this tab).
+    void firebaseProvider().signOut().catch(() => undefined);
     save(null);
     setNotice(reason ?? null);
     setSession(null);

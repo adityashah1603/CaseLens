@@ -6,6 +6,7 @@ import { ApiContext } from "./api/ApiContext.ts";
 import { ApiError, createApiConnection } from "./api/client.ts";
 import { useMe } from "./api/queries.ts";
 import { useAuth } from "./auth/AuthContext.ts";
+import { firebaseProvider } from "./auth/firebase.ts";
 import { SessionProvider } from "./auth/SessionProvider.tsx";
 import { SignInPage } from "./auth/SignInPage.tsx";
 import type { AuthSession } from "./auth/types.ts";
@@ -15,6 +16,7 @@ import { Button } from "./components/ui/button.tsx";
 import { AdminPage } from "./features/admin/AdminPage.tsx";
 import { CaseWorkspace } from "./features/case/CaseWorkspace.tsx";
 import { CasesPage } from "./features/cases/CasesPage.tsx";
+import { BROWSE_CASES } from "./lib/nav.ts";
 
 function makeQueryClient(): QueryClient {
   return new QueryClient({
@@ -34,11 +36,11 @@ function TopBar() {
   const me = useMe();
   return (
     <header className="flex shrink-0 items-center gap-4 border-b border-slate-800 bg-slate-900 px-4 py-2 text-slate-100">
-      <Link to="/" className="flex items-center gap-1.5 font-semibold tracking-tight">
+      <Link to="/" state={BROWSE_CASES} className="flex items-center gap-1.5 font-semibold tracking-tight">
         <ScanSearch className="size-4" aria-hidden /> CaseLens
       </Link>
       <nav aria-label="Main" className="flex gap-3 text-sm text-slate-300">
-        <Link to="/" className="hover:text-white">
+        <Link to="/" state={BROWSE_CASES} className="hover:text-white">
           Cases
         </Link>
         {me.data?.user.is_admin === true && (
@@ -66,17 +68,22 @@ function TopBar() {
 
 function SignedIn({ session, children }: { session: AuthSession; children: ReactNode }) {
   const { signOut } = useAuth();
-  const token = session.token;
-  const api = useMemo(
-    () =>
-      createApiConnection({
-        getToken: () => token,
-        onUnauthorized: () => {
-          signOut("The API rejected the token (expired or invalid). Sign in again.");
-        },
-      }),
-    [token, signOut],
-  );
+  const { token, source } = session;
+  const api = useMemo(() => {
+    const onUnauthorized = () => {
+      signOut("The API rejected the token (expired or invalid). Sign in again.");
+    };
+    if (source === "firebase") {
+      // Firebase ID tokens expire after ~1 h: the SDK refreshes them, and a 401 forces one refresh.
+      const firebase = firebaseProvider();
+      return createApiConnection({
+        getToken: () => firebase.getIdToken(),
+        refreshToken: () => firebase.getIdToken(true),
+        onUnauthorized,
+      });
+    }
+    return createApiConnection({ getToken: () => token, onUnauthorized });
+  }, [token, source, signOut]);
   const queryClient = useMemo(() => makeQueryClient(), []);
   return (
     <ApiContext.Provider value={api}>

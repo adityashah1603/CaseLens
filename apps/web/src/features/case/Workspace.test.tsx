@@ -1,9 +1,10 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CASE_ID, EV_TAMPERED, insufficientFixture } from "../../test/fixtures.ts";
+import { http, HttpResponse } from "msw";
+import { CASE_ID, EV_AUDIO, EV_TAMPERED, EV_VIDEO, insufficientFixture } from "../../test/fixtures.ts";
 import { renderApp } from "../../test/render.tsx";
-import { mockState } from "../../test/server.ts";
+import { API, mockState, server, STORAGE } from "../../test/server.ts";
 import type { PdfDocumentLike } from "../viewer/pdfjs.ts";
 
 // pdf.js needs a real canvas; the fake page reproduces its viewport math (scale, y flip).
@@ -88,10 +89,44 @@ describe("case workspace: ask and open citations", () => {
     expect(audio).toHaveAttribute("data-end-ms", "52900");
     expect(screen.getByTestId("audio-speaker")).toHaveTextContent("SPEAKER_01");
     const el = within(audio).getByLabelText("Cited audio");
+    // The element streams the signed URL itself (Range requests), no whole-file Blob.
     await waitFor(() => {
-      expect(el.getAttribute("src")).toMatch(/^blob:synthetic-/);
+      expect(el.getAttribute("src")).toBe(`${STORAGE}/signed/${EV_AUDIO}?sig=SYNTHETIC`);
     });
     expect((el as HTMLAudioElement).currentTime).toBeCloseTo(41.2);
+  });
+
+  it("requests a fresh signed URL each time a media citation opens, and once more on a load error", async () => {
+    let issued = 0;
+    server.use(
+      http.get(`${API}/v1/cases/:caseId/evidence/:evidenceId/content`, ({ params }) => {
+        issued += 1;
+        const id = String(params["evidenceId"]);
+        return new HttpResponse(null, { status: 307, headers: { Location: `${STORAGE}/signed/${id}?sig=SYNTHETIC-${String(issued)}` } });
+      }),
+    );
+    const user = await askDemoQuestion();
+    const open = async () => {
+      await user.click(firstOf(screen.getAllByRole("button", { name: /^Citation 2: Video/ })));
+      return within(await screen.findByTestId("video-view")).getByLabelText("Cited video");
+    };
+    let video = await open();
+    await waitFor(() => {
+      expect(video.getAttribute("src")).toBe(`${STORAGE}/signed/${EV_VIDEO}?sig=SYNTHETIC-1`);
+    });
+    await user.click(screen.getByRole("button", { name: "Close evidence viewer" }));
+    video = await open();
+    await waitFor(() => {
+      expect(video.getAttribute("src")).toBe(`${STORAGE}/signed/${EV_VIDEO}?sig=SYNTHETIC-2`);
+    });
+    // The URL expired while open: the element errors, and the viewer asks for a new one.
+    fireEvent.error(video);
+    await waitFor(() => {
+      expect(video.getAttribute("src")).toBe(`${STORAGE}/signed/${EV_VIDEO}?sig=SYNTHETIC-3`);
+    });
+    fireEvent.error(video);
+    expect(await screen.findByText("The media file could not be played.")).toBeInTheDocument();
+    expect(issued).toBe(3);
   });
 
   it("opens a video citation at the frame with the bbox scaled to the rendered size", async () => {
@@ -112,6 +147,7 @@ describe("case workspace: ask and open citations", () => {
     expect(box.style.width).toBe("103px");
     expect(box.style.height).toBe("65.5px");
     expect((video as HTMLVideoElement).currentTime).toBeCloseTo(125);
+    expect(video.getAttribute("src")).toBe(`${STORAGE}/signed/${EV_VIDEO}?sig=SYNTHETIC`);
   });
 
   it("opens a table-row citation on the cited row with its neighbours", async () => {

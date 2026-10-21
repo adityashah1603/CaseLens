@@ -1,12 +1,23 @@
-import createClient, { type Client, type Middleware } from "openapi-fetch";
+import createClient, { type Client } from "openapi-fetch";
 import type { paths } from "./schema";
 import type { Problem } from "./types.ts";
 
 export const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
 
-export function apiBaseUrl(): string {
-  const fromEnv = import.meta.env.VITE_API_BASE_URL;
-  return fromEnv !== undefined && fromEnv !== "" ? fromEnv.replace(/\/+$/, "") : DEFAULT_API_BASE_URL;
+/**
+ * The API origin. `VITE_API_BASE_URL` wins when set. Otherwise a production build talks to its own
+ * origin with relative URLs (the API serves the SPA), and a dev build uses the local API.
+ */
+export function apiBaseUrl(
+  env: { fromEnv: string | undefined; prod: boolean } = {
+    fromEnv: import.meta.env.VITE_API_BASE_URL,
+    prod: import.meta.env.PROD,
+  },
+): string {
+  const { fromEnv, prod } = env;
+  const value = fromEnv?.trim() ?? "";
+  if (value !== "") return value.replace(/\/+$/, "");
+  return prod ? "" : DEFAULT_API_BASE_URL;
 }
 
 export type ApiClient = Client<paths>;
@@ -47,37 +58,65 @@ export interface ApiConnection {
 
 export interface ApiConnectionOptions {
   baseUrl?: string;
-  getToken: () => string | null;
+  /** The current bearer token (may be async, e.g. Firebase's cached, auto-refreshed ID token). */
+  getToken: () => string | null | Promise<string | null>;
+  /**
+   * Mints a fresh token after a 401 (Firebase: `getIdToken(true)`). When set, the request is
+   * retried once with the new token before `onUnauthorized` fires.
+   */
+  refreshToken?: () => Promise<string | null>;
   onUnauthorized?: () => void;
   fetchImpl?: typeof fetch;
 }
 
-/** A typed `openapi-fetch` client that sends `Authorization: Bearer <token>` on every request. */
+function withToken(headers: Headers, token: string | null): void {
+  if (token !== null) headers.set("Authorization", `Bearer ${token}`);
+}
+
+/**
+ * A typed `openapi-fetch` client that sends `Authorization: Bearer <token>` on every request. A
+ * 401 triggers one retry with a refreshed token (when the session can refresh); a second 401
+ * reports `onUnauthorized`.
+ */
 export function createApiConnection(opts: ApiConnectionOptions): ApiConnection {
   const baseUrl = opts.baseUrl ?? apiBaseUrl();
   const fetchImpl = opts.fetchImpl ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
-  const client = createClient<paths>({ baseUrl, fetch: (req: Request) => fetchImpl(req) });
-  const auth: Middleware = {
-    onRequest({ request }) {
-      const token = opts.getToken();
-      if (token !== null) request.headers.set("Authorization", `Bearer ${token}`);
-      return request;
-    },
-    onResponse({ response }) {
-      if (response.status === 401) opts.onUnauthorized?.();
-      return response;
-    },
-  };
-  client.use(auth);
 
-  const fetchRaw = async (path: string, init: RequestInit = {}): Promise<Response> => {
-    const headers = new Headers(init.headers);
-    const token = opts.getToken();
-    if (token !== null) headers.set("Authorization", `Bearer ${token}`);
-    const response = await fetchImpl(`${baseUrl}${path}`, { ...init, headers });
+  /** Sends one request built by `build(token)`, retrying once with a refreshed token on 401. */
+  const send = async (build: (token: string | null) => Promise<Response>): Promise<Response> => {
+    let response = await build(await opts.getToken());
+    if (response.status === 401 && opts.refreshToken !== undefined) {
+      const fresh = await opts.refreshToken().catch(() => null);
+      if (fresh !== null) {
+        await response.body?.cancel().catch(() => undefined);
+        response = await build(fresh);
+      }
+    }
     if (response.status === 401) opts.onUnauthorized?.();
     return response;
   };
+
+  const client = createClient<paths>({
+    baseUrl,
+    fetch: (req: Request) => {
+      // Keep an unread copy so a retry can resend the body (only when a retry is possible).
+      const spare = opts.refreshToken === undefined ? null : req.clone();
+      let first = true;
+      return send((token) => {
+        const request = first || spare === null ? req : spare;
+        first = false;
+        withToken(request.headers, token);
+        return fetchImpl(request);
+      });
+    },
+  });
+
+  const fetchRaw = (path: string, init: RequestInit = {}): Promise<Response> =>
+    send((token) => {
+      const headers = new Headers(init.headers);
+      withToken(headers, token);
+      return fetchImpl(`${baseUrl}${path}`, { ...init, headers });
+    });
 
   return { client, baseUrl, fetchRaw };
 }

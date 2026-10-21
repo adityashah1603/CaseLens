@@ -1,16 +1,17 @@
-import { KeyRound, LogIn } from "lucide-react";
+import { KeyRound, Loader2, LogIn } from "lucide-react";
 import { useState, type SubmitEvent } from "react";
+import { AboutDemoText } from "../components/AboutDemo.tsx";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card.tsx";
 import { Label, Textarea } from "../components/ui/input.tsx";
 import { useAuth } from "./AuthContext.ts";
 import { devIdentities, devSession, devSignInEnabled } from "./dev.ts";
-import { FirebaseAuthProvider } from "./firebase.ts";
-
-const firebase = new FirebaseAuthProvider();
+import { firebaseProvider } from "./firebase.ts";
 
 export function SignInPage() {
   const { signIn, notice } = useAuth();
+  const firebase = firebaseProvider();
+  const [pending, setPending] = useState(false);
   const [pasted, setPasted] = useState("");
   const [firebaseError, setFirebaseError] = useState<string | null>(null);
   const devEnabled = devSignInEnabled();
@@ -37,23 +38,41 @@ export function SignInPage() {
       {firebase.available && (
         <Card>
           <CardHeader>
-            <CardTitle>Sign in</CardTitle>
+            <CardTitle>Try the demo</CardTitle>
+            <p className="text-sm text-slate-600">
+              All data here is <strong>SYNTHETIC</strong>. You sign in anonymously as a read-only viewer of the demo
+              case: you can ask questions and open every citation, but not upload or change anything.
+            </p>
           </CardHeader>
-          <CardContent className="flex flex-col gap-2">
-            <Button
-              onClick={() => {
-                firebase.signIn().then(signIn, (e: unknown) => {
-                  setFirebaseError(e instanceof Error ? e.message : "Sign-in failed.");
-                });
-              }}
-            >
-              <LogIn aria-hidden /> Sign in with Firebase
-            </Button>
+          <CardContent className="flex flex-col gap-3">
+            <div>
+              <Button
+                size="lg"
+                disabled={pending}
+                onClick={() => {
+                  setPending(true);
+                  setFirebaseError(null);
+                  firebase.signIn().then(signIn, (e: unknown) => {
+                    setPending(false);
+                    setFirebaseError(
+                      e instanceof Error ? `Demo sign-in failed: ${e.message}` : "Demo sign-in failed. Try again.",
+                    );
+                  });
+                }}
+              >
+                {pending ? <Loader2 className="animate-spin" aria-hidden /> : <LogIn aria-hidden />}
+                {pending ? "Signing in" : "Try the demo (read-only)"}
+              </Button>
+            </div>
             {firebaseError !== null && (
               <p role="alert" className="text-sm text-red-800">
                 {firebaseError}
               </p>
             )}
+            <div className="border-t border-slate-100 pt-3">
+              <h2 className="mb-1.5 text-sm font-semibold text-slate-900">About this demo</h2>
+              <AboutDemoText />
+            </div>
           </CardContent>
         </Card>
       )}

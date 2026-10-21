@@ -13,25 +13,34 @@ function seek(el: HTMLMediaElement, ms: number): void {
   }
 }
 
-/** Attaches the blob to the media element as an object URL, revoked when the blob changes. */
-function useBlobSource(ref: RefObject<HTMLMediaElement | null>, blob: Blob): void {
+/**
+ * Points the media element at `src` (a short-lived signed URL, or an object URL), so the browser
+ * streams it with Range requests and seeking does not need the whole file.
+ */
+function useMediaSource(ref: RefObject<HTMLMediaElement | null>, src: string): void {
   useEffect(() => {
     const el = ref.current;
     if (el === null) return;
-    const url = URL.createObjectURL(blob);
-    el.src = url;
+    el.src = src;
     return () => {
       el.removeAttribute("src");
-      URL.revokeObjectURL(url);
     };
-  }, [ref, blob]);
+  }, [ref, src]);
+}
+
+export interface MediaViewProps<L> {
+  /** The signed URL (or object URL) of the original. */
+  src: string;
+  locator: L;
+  /** The element failed to load `src` (for a signed URL: probably expired). */
+  onSourceError?: () => void;
 }
 
 /** Audio player that starts at the cited span and can replay exactly that span. */
-export function AudioView({ blob, locator }: { blob: Blob; locator: AudioLocator }) {
+export function AudioView({ src, locator, onSourceError }: MediaViewProps<AudioLocator>) {
   const ref = useRef<HTMLAudioElement>(null);
   const stopAtRef = useRef<number | null>(null);
-  useBlobSource(ref, blob);
+  useMediaSource(ref, src);
 
   const toStart = useCallback(() => {
     if (ref.current !== null) seek(ref.current, locator.start_ms);
@@ -70,6 +79,7 @@ export function AudioView({ blob, locator }: { blob: Blob; locator: AudioLocator
         className="w-full"
         aria-label="Cited audio"
         onLoadedMetadata={toStart}
+        onError={onSourceError}
         onTimeUpdate={(e) => {
           const stopAt = stopAtRef.current;
           if (stopAt !== null && e.currentTarget.currentTime >= stopAt) {
@@ -88,11 +98,11 @@ export function AudioView({ blob, locator }: { blob: Blob; locator: AudioLocator
 }
 
 /** Video player paused on the cited frame with the detection bbox drawn over it. */
-export function VideoView({ blob, locator }: { blob: Blob; locator: VideoLocator }) {
+export function VideoView({ src, locator, onSourceError }: MediaViewProps<VideoLocator>) {
   const ref = useRef<HTMLVideoElement>(null);
   const [box, setBox] = useState<Rect | null>(null);
   const [atFrame, setAtFrame] = useState(true);
-  useBlobSource(ref, blob);
+  useMediaSource(ref, src);
 
   const measure = useCallback(() => {
     const el = ref.current;
@@ -159,6 +169,7 @@ export function VideoView({ blob, locator }: { blob: Blob; locator: VideoLocator
           className="block h-auto w-full"
           aria-label="Cited video"
           onLoadedMetadata={toFrame}
+          onError={onSourceError}
           onSeeked={measure}
           onTimeUpdate={(e) => {
             setAtFrame(Math.abs(e.currentTarget.currentTime * 1000 - locator.start_ms) < 500);
