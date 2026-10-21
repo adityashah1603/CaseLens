@@ -133,3 +133,24 @@ owner), and point `CASELENS_PROD_OWNER_DATABASE_URL` at it.
   spoofable. Verify the header once after the first deploy.
 * The Space page embeds the app in an iframe from `*.hf.space`; the API and SPA are same-origin
   there, so no CORS configuration is needed.
+
+
+## Cloud Run (current, D-067)
+
+Hugging Face Docker Spaces need PRO, so the same image runs on Cloud Run's free tier in project
+`caselens-72505` (region `us-west1`, next to Neon). gcloud runs in Docker with the login kept in the
+`caselens-gcloud` volume (`docker run --rm -v caselens-gcloud:/root/.config
+gcr.io/google.com/cloudsdktool/google-cloud-cli:stable gcloud ...`).
+
+* Image: built from `Dockerfile.space` with the `VITE_FIREBASE_*` build args, pushed to
+  `us-west1-docker.pkg.dev/caselens-72505/caselens/caselens:<git sha>`. Artifact Registry is free up to
+  0.5 GB and the image is ~494 MB: **delete the previous image before pushing a new one.**
+* Secrets (Secret Manager, readable only by `caselens-run@caselens-72505.iam.gserviceaccount.com`):
+  `caselens-api-database-url`, `caselens-storage-signing-secret`, `caselens-gemini-api-key`.
+* Service: `gcloud run deploy caselens --image <img> --region us-west1 --port 7860 --memory 2Gi
+  --cpu 1 --min-instances 0 --max-instances 1 --concurrency 10 --timeout 300 --allow-unauthenticated
+  --service-account caselens-run@... --set-env-vars CASELENS_FIREBASE_PROJECT_ID=caselens-72505
+  --set-secrets CASELENS_API_DATABASE_URL=caselens-api-database-url:latest,...`
+* Cloud Run reserves paths ending in `z`, so `/healthz` is answered by Google (404) on run.app; use `/`.
+* Cost guard: scale to zero, max 1 instance, no CPU boost, $1 budget alert on the billing account.
+* Add the run.app host to Firebase Authentication > Settings > Authorized domains.

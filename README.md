@@ -7,7 +7,10 @@ CaseLens is an evidence-search copilot. Upload a mixed case file (PDFs, audio, v
 in plain English. Answers come back as a cited, auditable timeline: every claim links to its source page,
 timestamp, frame, or row, and the system says "insufficient evidence" instead of guessing.
 
-**Status:** Week 5 of 6, Evals + hardening (Week 4 gate passed: full flow in the browser). The demo case ingests end to
+**Live demo:** https://caselens-297413251550.us-west1.run.app (click *Try the demo*; read-only, SYNTHETIC
+data; the first visit after idle takes ~30 s to wake up, answers take ~10-60 s on the free LLM tier).
+
+**Status:** Week 6 of 6, Ship (public URL live). The demo case ingests end to
 end, all four modalities, and the investigator agent answers in plain English with citations (page + bbox,
 audio ms, video frame, table row), shows contradictions side by side, and refuses with "insufficient
 evidence" when nothing supports an answer. The web app (local dev sign-in for now; Firebase in Week 6)
