@@ -319,7 +319,8 @@ export interface paths {
          * Ask the investigator agent a question
          * @description Required role viewer: every member may ask, including the read-only demo user. Asking
          *     creates an agent run and may store conflict records (via `flag_conflict`); both are
-         *     allowed for viewers. Runs the agent loop
+         *     allowed for viewers. For the shared demo user (`is_demo`) conflicts are returned in the
+         *     answer but not stored, so visitors cannot write into the shared demo case. Runs the agent loop
          *     (at most 8 tool calls) over this case only; the case is bound from the path and is never a
          *     tool input. Returns the completed run, whose `answer` is an `AnswerContract`. An
          *     unsupported question yields `answer.status = insufficient_evidence`, not an error.
@@ -344,7 +345,9 @@ export interface paths {
         };
         /**
          * List agent runs in a case
-         * @description Required role viewer. Newest first.
+         * @description Required role viewer. Newest first. For the shared demo user (`is_demo`) only the caller's
+         *     own runs are listed (and `GET /runs/{run_id}` of another user's run is 404), so demo visitors
+         *     never see each other's questions.
          */
         get: operations["listRuns"];
         put?: never;

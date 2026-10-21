@@ -23,7 +23,9 @@ info:
       case. Viewers (including the demo user) get `403` on the mutating endpoints: case update,
       member management (add, change role, remove), evidence upload, and entity-link revert.
       Viewers MAY ask questions (`POST /v1/cases/{case_id}/ask`): that creates an agent run and
-      may store conflict records, which is allowed for every role.
+      may store conflict records, which is allowed for every role except the shared demo user
+      (`is_demo`): for demo users conflicts are shown in the answer but never stored
+      (`conflict_record_id` is null), and run listings show only the caller's own runs.
     - **Audit.** Every query, agent tool call, evidence view and mutation is written to an
       append-only, hash-chained audit log, readable by the case lead.
 
@@ -536,7 +538,8 @@ paths:
       description: |
         Required role viewer: every member may ask, including the read-only demo user. Asking
         creates an agent run and may store conflict records (via `flag_conflict`); both are
-        allowed for viewers. Runs the agent loop
+        allowed for viewers. For the shared demo user (`is_demo`) conflicts are returned in the
+        answer but not stored, so visitors cannot write into the shared demo case. Runs the agent loop
         (at most 8 tool calls) over this case only; the case is bound from the path and is never a
         tool input. Returns the completed run, whose `answer` is an `AnswerContract`. An
         unsupported question yields `answer.status = insufficient_evidence`, not an error.
@@ -570,7 +573,10 @@ paths:
       tags: [agent]
       operationId: listRuns
       summary: List agent runs in a case
-      description: Required role viewer. Newest first.
+      description: |
+        Required role viewer. Newest first. For the shared demo user (`is_demo`) only the caller's
+        own runs are listed (and `GET /runs/{run_id}` of another user's run is 404), so demo visitors
+        never see each other's questions.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
