@@ -60,7 +60,7 @@ def test_dev_verifier_refused_with_firebase_outside_local() -> None:
         build_verifier(settings)
 
 
-def test_local_dev_verifier_still_works() -> None:
+def test_local_dev_verifier_still_works(clean_env: pytest.MonkeyPatch) -> None:
     verifier = build_verifier(Settings(environment="local", dev_auth_secret=SecretStr(DEV_SECRET)))
     assert verifier.dev is not None and verifier.firebase is None
 

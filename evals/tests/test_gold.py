@@ -23,6 +23,12 @@ from caselens_evals.gold import (
     match_citation,
 )
 
+if not (build_gold.ANSWER_KEY_PATH.exists() and build_gold.MANIFEST_PATH.exists()):
+    # The answer key and manifest are generated data_gen output (gitignored); CI has neither.
+    pytest.skip(
+        "data_gen output not present (run python -m caselens_data_gen)", allow_module_level=True
+    )
+
 ITEMS = load_gold(build_gold.GOLD_PATH)
 FACTS: list[dict[str, Any]] = json.loads(build_gold.ANSWER_KEY_PATH.read_text(encoding="utf-8"))[
     "facts"
